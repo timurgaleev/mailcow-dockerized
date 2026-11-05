@@ -77,11 +77,11 @@ jQuery(function($){
   acl_data = JSON.parse(acl);
 
   $('.clear-last-logins').on('click', function () {if (confirm(lang.delete_ays)) {last_logins('reset');}})
-  $(".login-history").on('click', function(e) {e.preventDefault(); last_logins('get', $(this).data('days'));$(this).addClass('active').siblings().removeClass('active');});
+  $(".login-history").on('click', function(e) {e.preventDefault(); last_logins('get', $(this).data('days'));$(this).parent().find('li a').removeClass('active');$(this).children(':first-child').addClass('active')});
 
   function last_logins(action, days = 7) {
     if (action == 'get') {
-      $('.last-login').html('<i class="bi bi-hourglass"></i>' +  lang.waiting);
+      $('#spinner-last-login').removeClass('d-none');
       $.ajax({
         dataType: 'json',
         url: '/api/v1/get/last-login/' + encodeURIComponent(mailcow_cc_username) + '/' + days,
@@ -90,26 +90,31 @@ jQuery(function($){
           console.log('error reading last logins');
         },
         success: function (data) {
-          $('.last-login').html();
-          if (data.ui.time) {
-            $('.last-login').html('<i class="bi bi-person-fill"></i> ' + lang.last_ui_login + ': ' + unix_time_format(data.ui.time));
-          } else {
-            $('.last-login').text(lang.no_last_login);
-          }
+          $('.last-sasl-login').html('');
           if (data.sasl) {
-            $('.last-login').append('<ul class="list-group">');
+            $('.last-sasl-login').append('<ul class="list-group">');
             $.each(data.sasl, function (i, item) {
               var datetime = new Date(item.datetime.replace(/-/g, "/"));
               var local_datetime = datetime.toLocaleDateString(undefined, {year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit"});
-              var service = '<div class="label label-default">' + item.service.toUpperCase() + '</div>';
-              var app_password = item.app_password ? ' <a href="/edit/app-passwd/' + item.app_password + '"><i class="bi bi-app-indicator"></i> ' + escapeHtml(item.app_password_name || "App") + '</a>' : '';
-              var real_rip = item.real_rip.startsWith("Web") ? item.real_rip : '<a href="https://bgp.he.net/ip/' + item.real_rip + '" target="_blank">' + item.real_rip + "</a>";
-              var ip_location = item.location ? ' <span class="flag-icon flag-icon-' + item.location.toLowerCase() + '"></span>' : '';
+              var service = '<div class="badge bg-secondary">' + item.service.toUpperCase() + '</div>';
+              var app_password = item.app_password ? ' <a href="/edit/app-passwd/' + item.app_password + '"><i class="bi bi-key-fill"></i><span class="ms-1">' + escapeHtml(item.app_password_name || "App") + '</span></a>' : '';
+              var real_rip = item.real_rip.startsWith("Web") ? escapeHtml(item.real_rip) : '<a href="https://bgp.tools/prefix/' + escapeHtml(item.real_rip) + '" target="_blank">' + escapeHtml(item.real_rip) + "</a>";
+              var ip_location = item.location ? ' <span class="flag-icon flag-icon-' + escapeHtml(item.location.toLowerCase()) + '"></span>' : '';
               var ip_data = real_rip + ip_location + app_password;
-              $(".last-login").append('<li class="list-group-item">' + local_datetime + " " + service + " " + lang.from + " " + ip_data + "</li>");
+
+              $(".last-sasl-login").append(`
+                <li class="list-group-item d-flex justify-content-between align-items-start">
+                  <div class="ms-2 me-auto d-flex flex-column">
+                    <div class="fw-bold">` + ip_location + real_rip + `</div>
+                    <small class="fst-italic mt-2">` + service + ` ` + local_datetime + `</small>` + app_password + `
+                  </div>
+                </li>
+              `);
             })
-            $('.last-login').append('</ul>');
+            $('.last-sasl-login').append('</ul>');
           }
+
+          $('#spinner-last-login').addClass('d-none');
         }
       })
     } else if (action == 'reset') {
@@ -127,151 +132,278 @@ jQuery(function($){
     }
   }
 
+
+  function createSortableDate(td, cellData, date_string = false) {
+    if (date_string)
+      var date = new Date(cellData);
+    else
+      var date = new Date(cellData ? cellData * 1000 : 0);
+
+    var timestamp = date.getTime();
+    $(td).attr({
+      "data-order": timestamp,
+      "data-sort": timestamp
+    });
+    $(td).html(date.toLocaleDateString(LOCALE, DATETIME_FORMAT));
+  }
   function draw_tla_table() {
-    ft_tla_table = FooTable.init('#tla_table', {
-      "columns": [
-        {"name":"chkbox","title":"","style":{"min-width":"60px","width":"60px","text-align":"center"},"filterable": false,"sortable": false,"type":"html"},
-        {"name":"address","title":lang.alias},
-        {"name":"validity","formatter":function unix_time_format(tm) { var date = new Date(tm ? tm * 1000 : 0); return date.toLocaleDateString(undefined, {year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit"});},"title":lang.alias_valid_until,"style":{"width":"170px"}},
-        {"sorted": true,"sortValue": function(value){res = new Date(value);return res.getTime();},"direction":"DESC","name":"created","formatter":function date_format(datetime) { var date = new Date(datetime.replace(/-/g, "/")); return date.toLocaleDateString(undefined, {year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit"});},"title":lang.created_on,"style":{"width":"170px"}},
-        {"name":"action","filterable": false,"sortable": false,"style":{"text-align":"right","min-width":"220px","width":"220px"},"type":"html","title":lang.action,"breakpoints":"xs sm"}
-      ],
-      "empty": lang.empty,
-      "rows": $.ajax({
-        dataType: 'json',
-        url: '/api/v1/get/time_limited_aliases',
-        jsonp: false,
-        error: function () {
-          console.log('Cannot draw tla table');
-        },
-        success: function (data) {
+    // just recalc width if instance already exists
+    if ($.fn.DataTable.isDataTable('#tla_table') ) {
+      $('#tla_table').DataTable().columns.adjust().responsive.recalc();
+      return;
+    }
+
+    $('#tla_table').DataTable({
+      responsive: true,
+      processing: true,
+      serverSide: false,
+      stateSave: true,
+      pageLength: pagination_size,
+      dom: "<'row'<'col-sm-12 col-md-6'f><'col-sm-12 col-md-6'l>>" +
+           "tr" +
+           "<'row'<'col-sm-12 col-md-5'i><'col-sm-12 col-md-7'p>>",
+      language: lang_datatables,
+      order: [[4, 'desc']],
+      ajax: {
+        type: "GET",
+        url: "/api/v1/get/time_limited_aliases",
+        dataSrc: function(data){
           $.each(data, function (i, item) {
             if (acl_data.spam_alias === 1) {
-              item.action = '<div class="btn-group footable-actions">' +
+              item.action = '<div class="btn-group">' +
                 '<a href="#" data-action="delete_selected" data-id="single-tla" data-api-url="delete/time_limited_alias" data-item="' + encodeURIComponent(item.address) + '" class="btn btn-xs btn-danger"><i class="bi bi-trash"></i> ' + lang.remove + '</a>' +
                 '</div>';
-              item.chkbox = '<input type="checkbox" data-id="tla" name="multi_select" value="' + encodeURIComponent(item.address) + '" />';
+              item.chkbox = '<input type="checkbox" class="form-check-input" data-id="tla" name="multi_select" value="' + encodeURIComponent(item.address) + '" />';
               item.address = escapeHtml(item.address);
+              item.validity = {
+                value: item.validity,
+                permanent: item.permanent
+              };
             }
             else {
-              item.chkbox = '<input type="checkbox" disabled />';
+              item.chkbox = '<input type="checkbox" class="form-check-input" disabled />';
               item.action = '<span>-</span>';
             }
           });
+
+          return data;
         }
-      }),
-      "paging": {
-        "enabled": true,
-        "limit": 5,
-        "size": pagination_size
       },
-      "state": {"enabled": true},
-      "sorting": {
-        "enabled": true
-      },
-      "toggleSelector": "table tbody span.footable-toggle"
+      columns: [
+        {
+          // placeholder, so checkbox will not block child row toggle
+          title: '',
+          data: null,
+          searchable: false,
+          orderable: false,
+          defaultContent: ''
+        },
+        {
+          title: '',
+          data: 'chkbox',
+          searchable: false,
+          orderable: false,
+          defaultContent: ''
+        },
+        {
+          title: lang.alias,
+          data: 'address',
+          defaultContent: ''
+        },
+        {
+          title: lang.description,
+          data: 'description',
+          defaultContent: '',
+          render: function (data, type) {
+            return escapeHtml(data);
+          }
+        },
+        {
+          title: lang.alias_valid_until,
+          data: 'validity',
+          defaultContent: '',
+          render: function (data, type) {
+            var date = new Date(data.value ? data.value * 1000 : 0);
+            switch (type) {
+              case "sort":
+                if (data.permanent) {
+                  return 0;
+                }
+                return date.getTime();
+              default:
+                if (data.permanent) {
+                  return lang.forever;
+                }
+                return date.toLocaleDateString(LOCALE, DATETIME_FORMAT);
+            }
+          },
+        },
+        {
+          title: lang.created_on,
+          data: 'created',
+          defaultContent: '',
+          createdCell: function(td, cellData) {
+            createSortableDate(td, cellData, true)
+          }
+        },
+        {
+          title: lang.action,
+          data: 'action',
+          className: 'dt-sm-head-hidden dt-text-right',
+          defaultContent: ''
+        }
+      ]
     });
   }
   function draw_sync_job_table() {
-    ft_syncjob_table = FooTable.init('#sync_job_table', {
-      "columns": [
-        {"name":"chkbox","title":"","style":{"min-width":"60px","width":"60px","text-align":"center"},"filterable": false,"sortable": false,"type":"html"},
-        {"sorted": true,"name":"id","title":"ID","style":{"maxWidth":"60px","width":"60px","text-align":"center"}},
-        {"name":"server_w_port","title":"Server","breakpoints":"xs sm md","style":{"word-break":"break-all"}},
-        {"name":"enc1","title":lang.encryption,"breakpoints":"all"},
-        {"name":"user1","title":lang.username},
-        {"name":"exclude","title":lang.excludes,"breakpoints":"all"},
-        {"name":"mins_interval","title":lang.interval + " (min)","breakpoints":"all"},
-        {"name":"last_run","title":lang.last_run,"breakpoints":"xs sm md"},
-        {"name":"exit_status","filterable": false,"title":lang.syncjob_last_run_result},
-        {"name":"log","title":"Log"},
-        {"name":"active","filterable": false,"style":{"maxWidth":"70px","width":"70px"},"title":lang.active,"formatter": function(value){return 1==value?'<i class="bi bi-check-lg"></i>':0==value&&'<i class="bi bi-x-lg"></i>';}},
-        {"name":"is_running","filterable": false,"style":{"maxWidth":"120px","width":"100px"},"title":lang.status},
-        {"name":"action","filterable": false,"sortable": false,"style":{"text-align":"right","min-width":"260px","width":"260px"},"type":"html","title":lang.action,"breakpoints":"xs sm"}
-      ],
-      "empty": lang.empty,
-      "rows": $.ajax({
-        dataType: 'json',
+    // just recalc width if instance already exists
+    if ($.fn.DataTable.isDataTable('#sync_job_table') ) {
+      $('#sync_job_table').DataTable().columns.adjust().responsive.recalc();
+      return;
+    }
+
+    $('#sync_job_table').DataTable({
+      responsive: true,
+      processing: true,
+      serverSide: false,
+      stateSave: true,
+      pageLength: pagination_size,
+      dom: "<'row'<'col-sm-12 col-md-6'f><'col-sm-12 col-md-6'l>>" +
+           "tr" +
+           "<'row'<'col-sm-12 col-md-5'i><'col-sm-12 col-md-7'p>>",
+      language: lang_datatables,
+      // keep the backend order (C4: prio desc, never run first, least recently run)
+      order: [],
+      // drop state saved before the rework (it would restore the old ID sort / column visibility)
+      stateSaveParams: mailcowImapsync.jobTableStateSave,
+      stateLoadParams: mailcowImapsync.jobTableStateLoad,
+      ajax: {
+        type: "GET",
         url: '/api/v1/get/syncjobs/' + encodeURIComponent(mailcow_cc_username) + '/no_log',
-        jsonp: false,
-        error: function () {
-          console.log('Cannot draw sync job table');
-        },
-        success: function (data) {
+        dataSrc: function(data){
+          if (!Array.isArray(data)) return [];
           $.each(data, function (i, item) {
-            item.user1 = escapeHtml(item.user1);
-            item.log = '<a href="#syncjobLogModal" data-toggle="modal" data-syncjob-id="' + item.id + '">' + lang.open_logs + '</a>'
             if (!item.exclude > 0) {
               item.exclude = '-';
             } else {
               item.exclude  = '<code>' + escapeHtml(item.exclude) + '</code>';
             }
-            item.server_w_port = escapeHtml(item.user1 + '@' + item.host1 + ':' + item.port1);
+            mailcowImapsync.prepareJobRow(item);
             if (acl_data.syncjobs === 1) {
-              item.action = '<div class="btn-group footable-actions">' +
-                '<a href="/edit/syncjob/' + item.id + '" class="btn btn-xs btn-xs-half btn-default"><i class="bi bi-pencil-fill"></i> ' + lang.edit + '</a>' +
+              item.action = '<div class="btn-group">' +
+                '<a href="/edit/syncjob/' + item.id + '" class="btn btn-xs btn-xs-half btn-secondary"><i class="bi bi-pencil-fill"></i> ' + lang.edit + '</a>' +
+                '<a href="#syncjobLogModal" data-bs-toggle="modal" data-syncjob-id="' + item.id + '" class="btn btn-xs btn-xs-half btn-info"><i class="bi bi-card-list"></i> ' + lang.open_logs + '</a>' +
                 '<a href="#" data-action="delete_selected" data-id="single-syncjob" data-api-url="delete/syncjob" data-item="' + item.id + '" class="btn btn-xs btn-xs-half btn-danger"><i class="bi bi-trash"></i> ' + lang.remove + '</a>' +
                 '</div>';
-              item.chkbox = '<input type="checkbox" data-id="syncjob" name="multi_select" value="' + item.id + '" />';
+              item.chkbox = '<input type="checkbox" class="form-check-input" data-id="syncjob" name="multi_select" value="' + item.id + '" />';
             }
             else {
               item.action = '<span>-</span>';
-              item.chkbox = '<input type="checkbox" disabled />';
+              item.chkbox = '<input type="checkbox" class="form-check-input" disabled />';
             }
-            if (item.is_running == 1) {
-              item.is_running = '<span id="active-script" class="label label-success">' + lang.running + '</span>';
-            } else {
-              item.is_running = '<span id="inactive-script" class="label label-warning">' + lang.waiting + '</span>';
-            }
-            if (!item.last_run > 0) {
-              item.last_run = lang.waiting;
-            }
-            if (item.success == null) {
-              item.success = '-';
-              item.exit_status = '';
-            } else {
-              item.success = '<i class="text-' + (item.success == 1 ? 'success' : 'danger') + ' bi bi-' + (item.success == 1 ? 'check-lg' : 'x-lg') + '"></i>';
-            }
-            if (lang['syncjob_'+item.exit_status]) {
-	            item.exit_status = lang['syncjob_'+item.exit_status];
-            } else if (item.success != '-') {
-	            item.exit_status = lang.syncjob_check_log;
-            }
-            item.exit_status = item.success + ' ' + item.exit_status;
           });
+
+          return data;
         }
-      }),
-      "paging": {
-        "enabled": true,
-        "limit": 5,
-        "size": pagination_size
       },
-      "state": {"enabled": true},
-      "sorting": {
-        "enabled": true
-      },
-      "toggleSelector": "table tbody span.footable-toggle"
+      columns: [
+        {
+          // placeholder, so checkbox will not block child row toggle
+          title: '',
+          data: null,
+          searchable: false,
+          orderable: false,
+          defaultContent: '',
+          responsivePriority: 1
+        },
+        {
+          title: '',
+          data: 'chkbox',
+          searchable: false,
+          orderable: false,
+          defaultContent: '',
+          responsivePriority: 2
+        },
+        {
+          title: mailcowImapsync.L('id'),
+          data: 'id',
+          defaultContent: '',
+          responsivePriority: 3
+        },
+        {
+          title: lang.syncjobs.source_server,
+          data: 'server_w_port',
+          defaultContent: '',
+          responsivePriority: 4
+        },
+        {
+          title: lang.last_run,
+          data: 'last_run',
+          defaultContent: '',
+          responsivePriority: 7
+        },
+        {
+          title: lang.syncjobs.syncjob_last_run_result,
+          data: 'exit_status',
+          defaultContent: '',
+          responsivePriority: 6
+        },
+        {
+          title: lang.active,
+          data: 'active',
+          defaultContent: '',
+          responsivePriority: 8,
+          render: function (data, type) {
+            return 1==data?'<i class="bi bi-check-lg"></i>':0==data&&'<i class="bi bi-x-lg"></i>'
+          }
+        },
+        {
+          title: lang.status,
+          data: 'is_running',
+          defaultContent: '',
+          responsivePriority: 5
+        },
+        {
+          title: lang.excludes,
+          data: 'exclude',
+          defaultContent: ''
+        },
+        {
+          title: lang.interval + " (min)",
+          data: 'mins_interval',
+          defaultContent: ''
+        },
+        {
+          title: lang.action,
+          data: 'action',
+          className: 'dt-sm-head-hidden dt-text-right',
+          defaultContent: '',
+          responsivePriority: 5
+        }
+      ]
     });
   }
   function draw_app_passwd_table() {
-    ft_apppasswd_table = FooTable.init('#app_passwd_table', {
-      "columns": [
-        {"name":"chkbox","title":"","style":{"maxWidth":"60px","width":"60px","text-align":"center"},"filterable": false,"sortable": false,"type":"html"},
-        {"sorted": true,"name":"id","title":"ID","style":{"maxWidth":"60px","width":"60px","text-align":"center"}},
-        {"name":"name","title":lang.app_name},
-        {"name":"protocols","title":lang.allowed_protocols},
-        {"name":"active","filterable": false,"style":{"maxWidth":"70px","width":"70px"},"title":lang.active,"formatter": function(value){return 1==value?'<i class="bi bi-check-lg"></i>':0==value&&'<i class="bi bi-x-lg"></i>';}},
-        {"name":"action","filterable": false,"sortable": false,"style":{"text-align":"right","min-width":"220px","width":"220px"},"type":"html","title":lang.action,"breakpoints":"xs sm"}
-      ],
-      "empty": lang.empty,
-      "rows": $.ajax({
-        dataType: 'json',
+    // just recalc width if instance already exists
+    if ($.fn.DataTable.isDataTable('#app_passwd_table') ) {
+      $('#app_passwd_table').DataTable().columns.adjust().responsive.recalc();
+      return;
+    }
+
+    $('#app_passwd_table').DataTable({
+      responsive: true,
+      processing: true,
+      serverSide: false,
+      stateSave: true,
+      pageLength: pagination_size,
+      dom: "<'row'<'col-sm-12 col-md-6'f><'col-sm-12 col-md-6'l>>" +
+           "tr" +
+           "<'row'<'col-sm-12 col-md-5'i><'col-sm-12 col-md-7'p>>",
+      language: lang_datatables,
+      ajax: {
+        type: "GET",
         url: '/api/v1/get/app-passwd/all',
-        jsonp: false,
-        error: function () {
-          console.log('Cannot draw app passwd table');
-        },
-        success: function (data) {
+        dataSrc: function(data){
           $.each(data, function (i, item) {
             item.name = escapeHtml(item.name)
             item.protocols = []
@@ -283,124 +415,209 @@ jQuery(function($){
             if (item.sieve_access == 1) { item.protocols.push("<code>Sieve</code>"); }
             item.protocols = item.protocols.join(" ")
             if (acl_data.app_passwds === 1) {
-              item.action = '<div class="btn-group footable-actions">' +
-                '<a href="/edit/app-passwd/' + item.id + '" class="btn btn-xs btn-xs-half btn-default"><i class="bi bi-pencil-fill"></i> ' + lang.edit + '</a>' +
+              item.action = '<div class="btn-group">' +
+                '<a href="/edit/app-passwd/' + item.id + '" class="btn btn-xs btn-xs-half btn-secondary"><i class="bi bi-pencil-fill"></i> ' + lang.edit + '</a>' +
                 '<a href="#" data-action="delete_selected" data-id="single-apppasswd" data-api-url="delete/app-passwd" data-item="' + item.id + '" class="btn btn-xs btn-xs-half btn-danger"><i class="bi bi-trash"></i> ' + lang.remove + '</a>' +
                 '</div>';
-              item.chkbox = '<input type="checkbox" data-id="apppasswd" name="multi_select" value="' + item.id + '" />';
+              item.chkbox = '<input type="checkbox" class="form-check-input" data-id="apppasswd" name="multi_select" value="' + item.id + '" />';
             }
             else {
               item.action = '<span>-</span>';
-              item.chkbox = '<input type="checkbox" disabled />';
+              item.chkbox = '<input type="checkbox" class="form-check-input" disabled />';
             }
           });
+
+          return data;
         }
-      }),
-      "paging": {
-        "enabled": true,
-        "limit": 5,
-        "size": pagination_size
       },
-      "state": {"enabled": true},
-      "sorting": {
-        "enabled": true
-      },
-      "toggleSelector": "table tbody span.footable-toggle"
+      columns: [
+        {
+          // placeholder, so checkbox will not block child row toggle
+          title: '',
+          data: null,
+          searchable: false,
+          orderable: false,
+          defaultContent: ''
+        },
+        {
+          title: '',
+          data: 'chkbox',
+          searchable: false,
+          orderable: false,
+          defaultContent: ''
+        },
+        {
+          title: 'ID',
+          data: 'id',
+          defaultContent: ''
+        },
+        {
+          title: lang.app_name,
+          data: 'name',
+          defaultContent: ''
+        },
+        {
+          title: lang.allowed_protocols,
+          data: 'protocols',
+          defaultContent: ''
+        },
+        {
+          title: lang.active,
+          data: 'active',
+          defaultContent: '',
+          render: function (data, type) {
+            return 1==data?'<i class="bi bi-check-lg"></i>':0==data&&'<i class="bi bi-x-lg"></i>'
+          }
+        },
+        {
+          title: lang.action,
+          data: 'action',
+          className: 'dt-sm-head-hidden dt-text-right',
+          defaultContent: ''
+        }
+      ]
     });
   }
   function draw_wl_policy_mailbox_table() {
-    ft_wl_policy_mailbox_table = FooTable.init('#wl_policy_mailbox_table', {
-      "columns": [
-        {"name":"chkbox","title":"","style":{"maxWidth":"40px","width":"40px","text-align":"center"},"filterable": false,"sortable": false,"type":"html"},
-        {"name":"prefid","style":{"maxWidth":"40px","width":"40px"},"title":"ID","filterable": false,"sortable": false},
-        {"sorted": true,"name":"value","title":lang.spamfilter_table_rule},
-        {"name":"object","title":"Scope"}
-      ],
-      "empty": lang.empty,
-      "rows": $.ajax({
-        dataType: 'json',
+    // just recalc width if instance already exists
+    if ($.fn.DataTable.isDataTable('#wl_policy_mailbox_table') ) {
+      $('#wl_policy_mailbox_table').DataTable().columns.adjust().responsive.recalc();
+      return;
+    }
+
+    $('#wl_policy_mailbox_table').DataTable({
+      responsive: true,
+      processing: true,
+      serverSide: false,
+      stateSave: true,
+      pageLength: pagination_size,
+      dom: "<'row'<'col-sm-12 col-md-6'f><'col-sm-12 col-md-6'l>>" +
+           "tr" +
+           "<'row'<'col-sm-12 col-md-5'i><'col-sm-12 col-md-7'p>>",
+      language: lang_datatables,
+      ajax: {
+        type: "GET",
         url: '/api/v1/get/policy_wl_mailbox',
-        jsonp: false,
-        error: function () {
-          console.log('Cannot draw mailbox policy wl table');
-        },
-        success: function (data) {
+        dataSrc: function(data){
           $.each(data, function (i, item) {
             if (validateEmail(item.object)) {
-              item.chkbox = '<input type="checkbox" data-id="policy_wl_mailbox" name="multi_select" value="' + item.prefid + '" />';
+              item.chkbox = '<input type="checkbox" class="form-check-input" data-id="policy_wl_mailbox" name="multi_select" value="' + item.prefid + '" />';
             }
             else {
-              item.chkbox = '<input type="checkbox" disabled title="' + lang.spamfilter_table_domain_policy + '" />';
+              item.chkbox = '<input type="checkbox" class="form-check-input" disabled title="' + lang.spamfilter_table_domain_policy + '" />';
             }
             if (acl_data.spam_policy === 0) {
-              item.chkbox = '<input type="checkbox" disabled />';
+              item.chkbox = '<input type="checkbox" class="form-check-input" disabled />';
             }
           });
+
+          return data;
         }
-      }),
-      "state": {"enabled": true},
-      "paging": {
-        "enabled": true,
-        "limit": 5,
-        "size": pagination_size
       },
-      "sorting": {
-        "enabled": true
-      }
+      columns: [
+        {
+          // placeholder, so checkbox will not block child row toggle
+          title: '',
+          data: null,
+          searchable: false,
+          orderable: false,
+          defaultContent: ''
+        },
+        {
+          title: '',
+          data: 'chkbox',
+          searchable: false,
+          orderable: false,
+          defaultContent: ''
+        },
+        {
+          title: 'ID',
+          data: 'prefid',
+          defaultContent: ''
+        },
+        {
+          title: lang.spamfilter_table_rule,
+          data: 'value',
+          defaultContent: ''
+        },
+        {
+          title:'Scope',
+          data: 'object',
+          defaultContent: ''
+        }
+      ]
     });
   }
   function draw_bl_policy_mailbox_table() {
-    ft_bl_policy_mailbox_table = FooTable.init('#bl_policy_mailbox_table', {
-      "columns": [
-        {"name":"chkbox","title":"","style":{"maxWidth":"40px","width":"40px","text-align":"center"},"filterable": false,"sortable": false,"type":"html"},
-        {"name":"prefid","style":{"maxWidth":"40px","width":"40px"},"title":"ID","filterable": false,"sortable": false},
-        {"sorted": true,"name":"value","title":lang.spamfilter_table_rule},
-        {"name":"object","title":"Scope"}
-      ],
-      "empty": lang.empty,
-      "rows": $.ajax({
-        dataType: 'json',
+    // just recalc width if instance already exists
+    if ($.fn.DataTable.isDataTable('#bl_policy_mailbox_table') ) {
+      $('#bl_policy_mailbox_table').DataTable().columns.adjust().responsive.recalc();
+      return;
+    }
+
+    $('#bl_policy_mailbox_table').DataTable({
+      responsive: true,
+      processing: true,
+      serverSide: false,
+      stateSave: true,
+      pageLength: pagination_size,
+      dom: "<'row'<'col-sm-12 col-md-6'f><'col-sm-12 col-md-6'l>>" +
+           "tr" +
+           "<'row'<'col-sm-12 col-md-5'i><'col-sm-12 col-md-7'p>>",
+      language: lang_datatables,
+      ajax: {
+        type: "GET",
         url: '/api/v1/get/policy_bl_mailbox',
-        jsonp: false,
-        error: function () {
-          console.log('Cannot draw mailbox policy bl table');
-        },
-        success: function (data) {
+        dataSrc: function(data){
           $.each(data, function (i, item) {
             if (validateEmail(item.object)) {
-              item.chkbox = '<input type="checkbox" data-id="policy_bl_mailbox" name="multi_select" value="' + item.prefid + '" />';
+              item.chkbox = '<input type="checkbox" class="form-check-input" data-id="policy_bl_mailbox" name="multi_select" value="' + item.prefid + '" />';
             }
             else {
-              item.chkbox = '<input type="checkbox" disabled tooltip="' + lang.spamfilter_table_domain_policy + '" />';
+              item.chkbox = '<input type="checkbox" class="form-check-input" disabled tooltip="' + lang.spamfilter_table_domain_policy + '" />';
             }
             if (acl_data.spam_policy === 0) {
-              item.chkbox = '<input type="checkbox" disabled />';
+              item.chkbox = '<input type="checkbox" class="form-check-input" disabled />';
             }
           });
+
+          return data;
         }
-      }),
-      "paging": {
-        "enabled": true,
-        "limit": 5,
-        "size": pagination_size
       },
-      "state": {"enabled": true},
-      "sorting": {
-        "enabled": true
-      }
+      columns: [
+        {
+          // placeholder, so checkbox will not block child row toggle
+          title: '',
+          data: null,
+          searchable: false,
+          orderable: false,
+          defaultContent: ''
+        },
+        {
+          title: '',
+          data: 'chkbox',
+          searchable: false,
+          orderable: false,
+          defaultContent: ''
+        },
+        {
+          title: 'ID',
+          data: 'prefid',
+          defaultContent: ''
+        },
+        {
+          title: lang.spamfilter_table_rule,
+          data: 'value',
+          defaultContent: ''
+        },
+        {
+          title:'Scope',
+          data: 'object',
+          defaultContent: ''
+        }
+      ]
     });
   }
-
-  $('body').on('click', 'span.footable-toggle', function () {
-    event.stopPropagation();
-  })
-
-  draw_sync_job_table();
-  draw_app_passwd_table();
-  draw_tla_table();
-  draw_wl_policy_mailbox_table();
-  draw_bl_policy_mailbox_table();
-  last_logins('get');
 
   // FIDO2 friendly name modal
   $('#fido2ChangeFn').on('show.bs.modal', function (e) {
@@ -433,4 +650,29 @@ jQuery(function($){
   $('#userFilterModal').on('hidden.bs.modal', function () {
     $('#user_sieve_filter').text(lang.loading);
   });
+
+  // detect element visibility changes
+  function onVisible(element, callback) {
+    $(document).ready(function() {
+      element_object = document.querySelector(element);
+      if (element_object === null) return;
+
+      new IntersectionObserver((entries, observer) => {
+        entries.forEach(entry => {
+          if(entry.intersectionRatio > 0) {
+            callback(element_object);
+          }
+        });
+      }).observe(element_object);
+    });
+  }
+
+  // Load only if the tab is visible
+  onVisible("[id^=tla_table]", () => draw_tla_table());
+  onVisible("[id^=bl_policy_mailbox_table]", () => draw_bl_policy_mailbox_table());
+  onVisible("[id^=wl_policy_mailbox_table]", () => draw_wl_policy_mailbox_table());
+  onVisible("[id^=sync_job_table]", () => draw_sync_job_table());
+  onVisible("[id^=imapsync_source_table]", () => mailcowImapsync.drawSourceTable(acl_data.syncjobs === 1));
+  onVisible("[id^=app_passwd_table]", () => draw_app_passwd_table());
+  onVisible("[id^=recent-logins]", () => last_logins('get'));
 });

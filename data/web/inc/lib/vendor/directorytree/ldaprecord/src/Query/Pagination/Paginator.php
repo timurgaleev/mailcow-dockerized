@@ -7,17 +7,17 @@ use LdapRecord\LdapInterface;
 class Paginator extends AbstractPaginator
 {
     /**
-     * @inheritdoc
+     * {@inheritdoc}
      */
-    protected function fetchCookie()
+    protected function fetchCookie(): ?string
     {
         return $this->query->controls[LDAP_CONTROL_PAGEDRESULTS]['value']['cookie'] ?? null;
     }
 
     /**
-     * @inheritdoc
+     * {@inheritdoc}
      */
-    protected function prepareServerControls()
+    protected function prepareServerControls(): void
     {
         $this->query->addControl(LDAP_CONTROL_PAGEDRESULTS, $this->isCritical, [
             'size' => $this->perPage, 'cookie' => '',
@@ -25,47 +25,40 @@ class Paginator extends AbstractPaginator
     }
 
     /**
-     * @inheritdoc
+     * {@inheritdoc}
      */
-    protected function applyServerControls(LdapInterface $ldap)
+    protected function applyServerControls(LdapInterface $ldap): void
     {
         $ldap->setOption(LDAP_OPT_SERVER_CONTROLS, $this->query->controls);
     }
 
     /**
-     * @inheritdoc
+     * {@inheritdoc}
      */
-    protected function updateServerControls(LdapInterface $ldap, $resource)
+    protected function updateServerControls(LdapInterface $ldap, mixed $resource): void
     {
-        $errorCode = $dn = $errorMessage = $refs = null;
+        $controls = $this->query->controls;
 
-        $ldap->parseResult(
-            $resource,
-            $errorCode,
-            $dn,
-            $errorMessage,
-            $refs,
-            $this->query->controls
+        $response = $ldap->parseResult(
+            result: $resource,
+            controls: $controls
         );
 
-        $this->resetPageSize();
+        $controls = array_merge($controls, $response->controls ?? []);
+
+        $cookie = $controls[LDAP_CONTROL_PAGEDRESULTS]['value']['cookie'] ?? '';
+
+        $this->query->controls[LDAP_CONTROL_PAGEDRESULTS]['value'] = [
+            'size' => $this->perPage,
+            'cookie' => $cookie,
+        ];
     }
 
     /**
-     * Reset the page control page size.
-     *
-     * @return void
+     * {@inheritdoc}
      */
-    protected function resetPageSize()
+    protected function resetServerControls(LdapInterface $ldap): void
     {
-        $this->query->controls[LDAP_CONTROL_PAGEDRESULTS]['value']['size'] = $this->perPage;
-    }
-
-    /**
-     * @inheritdoc
-     */
-    protected function resetServerControls(LdapInterface $ldap)
-    {
-        $this->query->controls = [];
+        unset($this->query->controls[LDAP_CONTROL_PAGEDRESULTS]);
     }
 }

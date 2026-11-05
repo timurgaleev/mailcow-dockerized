@@ -2,9 +2,9 @@
 /*
    see /api
 */
-
-header('Content-Type: application/json');
 require_once $_SERVER['DOCUMENT_ROOT'] . '/inc/prerequisites.inc.php';
+cors("set_headers");
+header('Content-Type: application/json');
 error_reporting(0);
 
 function api_log($_data) {
@@ -14,10 +14,12 @@ function api_log($_data) {
     if ($data == 'csrf_token') {
       continue;
     }
-    if ($value = json_decode($value, true)) {
-      unset($value["csrf_token"]);
+
+    $value = json_decode($value, true);
+    if ($value) {
+      if (is_array($value)) unset($value["csrf_token"]);
       foreach ($value as $key => &$val) {
-        if(preg_match("/pass/i", $key)) {
+        if(preg_match("/pass|secret|oauth_extra_params/i", $key)) {
           $val = '*';
         }
       }
@@ -25,6 +27,7 @@ function api_log($_data) {
     }
     $data_var[] = $data . "='" . $value . "'";
   }
+
   try {
     $log_line = array(
       'time' => time(),
@@ -42,6 +45,12 @@ function api_log($_data) {
     );
     return false;
   }
+}
+
+// Block requests not intended for direct API use by checking the 'Sec-Fetch-Dest' header.
+if (isset($_SERVER['HTTP_SEC_FETCH_DEST']) && $_SERVER['HTTP_SEC_FETCH_DEST'] !== 'empty') {
+  header('HTTP/1.1 403 Forbidden');
+  exit;
 }
 
 if (isset($_GET['query'])) {
@@ -83,17 +92,41 @@ if (isset($_GET['query'])) {
       $_POST['items'] = $request;
     }
 
+    // search
+    if ($action == 'search') {
+      // placeholder for search, as the request body is already decoded and available in $requestDecoded
+    }
   }
   api_log($_POST);
+
 
   $request_incomplete = json_encode(array(
     'type' => 'error',
     'msg' => 'Cannot find attributes in post data'
   ));
 
+  // A login with pending 2FA setup or password update may only use the calls of these steps
+  if (!empty($_SESSION['pending_tfa_setup']) || !empty($_SESSION['pending_pw_update'])) {
+    if (!empty($_SESSION['pending_tfa_setup'])) {
+      $pending_allowed = array('get/passwordpolicy', 'get/webauthn-tfa-registration', 'add/webauthn-tfa-registration');
+    }
+    else {
+      // the WebAuthn login of a TFA account comes before the password update
+      $pending_allowed = array('get/passwordpolicy', 'get/webauthn-tfa-get-args', 'edit/self', 'edit/admin');
+    }
+    if (!in_array($action . '/' . $category, $pending_allowed)) {
+      http_response_code(403);
+      echo json_encode(array(
+        'type' => 'error',
+        'msg' => 'API access denied until the pending account setup is finished'
+      ));
+      exit();
+    }
+  }
+
   switch ($action) {
     case "add":
-      if ($_SESSION['mailcow_cc_api_access'] == 'ro' || isset($_SESSION['pending_mailcow_cc_username'])) {
+      if ($_SESSION['mailcow_cc_api_access'] == 'ro' || isset($_SESSION['pending_mailcow_cc_username']) || !isset($_SESSION["mailcow_cc_username"])) {
         http_response_code(403);
         echo json_encode(array(
             'type' => 'error',
@@ -117,12 +150,12 @@ if (isset($_GET['query'])) {
           echo isset($_SESSION['return']) ? json_encode($_SESSION['return']) : $generic_success;
         }
       }
-      if (!isset($_POST['attr']) && $category != "fido2-registration") {
+      if (!isset($_POST['attr']) && $category != "fido2-registration" && $category != "webauthn-tfa-registration") {
         echo $request_incomplete;
         exit;
       }
       else {
-        if ($category != "fido2-registration") {
+        if ($category != "fido2-registration" && $category != "webauthn-tfa-registration") {
           $attr = (array)json_decode($_POST['attr'], true);
         }
         unset($attr['csrf_token']);
@@ -160,6 +193,8 @@ if (isset($_GET['query'])) {
               exit;
             }
             fido2(array("action" => "register", "registration" => $data));
+            // Release pending_tfa_setup session hold
+            unset($_SESSION['pending_tfa_setup']);
             $return = new stdClass();
             $return->success = true;
             echo json_encode($return);
@@ -169,6 +204,50 @@ if (isset($_GET['query'])) {
             echo $request_incomplete;
             exit;
           }
+        break;
+        case "webauthn-tfa-registration":
+            if (isset($_SESSION["mailcow_cc_role"])) {
+              // parse post data
+              $post = trim(file_get_contents('php://input'));
+              if ($post) $post = json_decode($post);
+
+              // process registration data from authenticator
+              try {
+                // decode base64 strings
+                $clientDataJSON = base64_decode($post->clientDataJSON);
+                $attestationObject = base64_decode($post->attestationObject);
+
+                // processCreate($clientDataJSON, $attestationObject, $challenge, $requireUserVerification=false, $requireUserPresent=true, $failIfRootMismatch=true)
+                $data = $WebAuthn->processCreate($clientDataJSON, $attestationObject, $_SESSION['challenge'], false, true);
+
+                // safe authenticator in mysql `tfa` table
+                $_data['tfa_method'] = $post->tfa_method;
+                $_data['key_id'] = $post->key_id;
+                $_data['confirm_password'] = $post->confirm_password;
+                $_data['registration'] = $data;
+                set_tfa($_data);
+              }
+              catch (Throwable $ex) {
+                // err
+                $return = new stdClass();
+                $return->success = false;
+                $return->msg = $ex->getMessage();
+                echo json_encode($return);
+                exit;
+              }
+
+
+              // send response
+              $return = new stdClass();
+              $return->success = true;
+              echo json_encode($return);
+              exit;
+            }
+            else {
+              // err - request incomplete
+              echo $request_incomplete;
+              exit;
+            }
         break;
         case "time_limited_alias":
           process_add_return(mailbox('add', 'time_limited_alias', $attr));
@@ -183,13 +262,33 @@ if (isset($_GET['query'])) {
           process_add_return(rsettings('add', $attr));
         break;
         case "mailbox":
-          process_add_return(mailbox('add', 'mailbox', $attr));
+          switch ($object) {
+            case "template":
+              process_add_return(mailbox('add', 'mailbox_templates', $attr));
+            break;
+            default:
+              process_add_return(mailbox('add', 'mailbox', $attr));
+            break;
+          }
         break;
         case "oauth2-client":
           process_add_return(oauth2('add', 'client', $attr));
         break;
+        case "api-key":
+          process_add_return(\Mailcow\ApiKey\ApiKeyModule::fromGlobals()->api->addKey($attr));
+        break;
+        case "mailbox-group":
+          process_add_return(\Mailcow\MailboxGroup\MailboxGroupModule::fromGlobals()->api->addGroup($attr));
+        break;
         case "domain":
-          process_add_return(mailbox('add', 'domain', $attr));
+          switch ($object) {
+            case "template":
+              process_add_return(mailbox('add', 'domain_templates', $attr));
+            break;
+            default:
+              process_add_return(mailbox('add', 'domain', $attr));
+            break;
+          }
         break;
         case "resource":
           process_add_return(mailbox('add', 'resource', $attr));
@@ -227,11 +326,26 @@ if (isset($_GET['query'])) {
         case "domain-admin":
           process_add_return(domain_admin('add', $attr));
         break;
+        case "sso":
+          switch ($object) {
+            case "domain-admin":
+              $data = domain_admin_sso('issue', $attr);
+              if($data) {
+                echo json_encode($data);
+                exit(0);
+              }
+              process_add_return($data);
+            break;
+          }
+        break;
         case "admin":
           process_add_return(admin('add', $attr));
         break;
         case "syncjob":
-          process_add_return(mailbox('add', 'syncjob', $attr));
+          process_add_return(\Mailcow\Imapsync\ImapsyncModule::fromGlobals()->api->addJob($attr));
+        break;
+        case "syncjob_source":
+          process_add_return(\Mailcow\Imapsync\ImapsyncModule::fromGlobals()->api->addSource($attr));
         break;
         case "bcc":
           process_add_return(bcc('add', $attr));
@@ -245,6 +359,9 @@ if (isset($_GET['query'])) {
         case "app-passwd":
           process_add_return(app_passwd('add', $attr));
         break;
+        case "mta-sts":
+          process_add_return(mailbox('add', 'mta_sts', $attr));
+        break;
         // return no route found if no case is matched
         default:
           http_response_code(404);
@@ -253,81 +370,6 @@ if (isset($_GET['query'])) {
             'msg' => 'route not found'
           ));
           exit();
-      }
-    break;
-    case "process":
-      // only allow POST requests to process API endpoints
-      if ($_SERVER['REQUEST_METHOD'] != 'POST') {
-        http_response_code(405);
-        echo json_encode(array(
-            'type' => 'error',
-            'msg' => 'only POST method is allowed'
-        ));
-        exit();
-      }
-      switch ($category) {
-        case "fido2-args":
-          header('Content-Type: application/json');
-          $post = trim(file_get_contents('php://input'));
-          if ($post) {
-            $post = json_decode($post);
-          }
-          $clientDataJSON = base64_decode($post->clientDataJSON);
-          $authenticatorData = base64_decode($post->authenticatorData);
-          $signature = base64_decode($post->signature);
-          $id = base64_decode($post->id);
-          $challenge = $_SESSION['challenge'];
-          $process_fido2 = fido2(array("action" => "get_by_b64cid", "cid" => $post->id));
-          if ($process_fido2['pub_key'] === false) {
-            $return = new stdClass();
-            $return->success = false;
-            echo json_encode($return);
-            exit;
-          }
-          try {
-            $WebAuthn->processGet($clientDataJSON, $authenticatorData, $signature, $process_fido2['pub_key'], $challenge, null, $GLOBALS['FIDO2_UV_FLAG_LOGIN'], $GLOBALS['FIDO2_USER_PRESENT_FLAG']);
-          }
-          catch (Throwable $ex) {
-            unset($process_fido2);
-            $return = new stdClass();
-            $return->success = false;
-            echo json_encode($return);
-            exit;
-          }
-          $return = new stdClass();
-          $return->success = true;
-          $stmt = $pdo->prepare("SELECT `superadmin` FROM `admin` WHERE `username` = :username");
-          $stmt->execute(array(':username' => $process_fido2['username']));
-          $obj_props = $stmt->fetch(PDO::FETCH_ASSOC);
-          if ($obj_props['superadmin'] === 1) {
-            $_SESSION["mailcow_cc_role"] = "admin";
-          }
-          elseif ($obj_props['superadmin'] === 0) {
-            $_SESSION["mailcow_cc_role"] = "domainadmin";
-          }
-          else {
-            $stmt = $pdo->prepare("SELECT `username` FROM `mailbox` WHERE `username` = :username");
-            $stmt->execute(array(':username' => $process_fido2['username']));
-            $row = $stmt->fetch(PDO::FETCH_ASSOC);
-            if ($row['username'] == $process_fido2['username']) {
-              $_SESSION["mailcow_cc_role"] = "user";
-            }
-          }
-          if (empty($_SESSION["mailcow_cc_role"])) {
-            session_unset();
-            session_destroy();
-            exit;
-          }
-          $_SESSION["mailcow_cc_username"] = $process_fido2['username'];
-          $_SESSION["fido2_cid"] = $process_fido2['cid'];
-          unset($_SESSION["challenge"]);
-          $_SESSION['return'][] =  array(
-            'type' => 'success',
-            'log' => array("fido2_login"),
-            'msg' => array('logged_in_as', $process_fido2['username'])
-          );
-          echo json_encode($return);
-        break;
       }
     break;
     case "get":
@@ -350,54 +392,16 @@ if (isset($_GET['query'])) {
         exit();
       }
       switch ($category) {
-        case "u2f-registration":
-          header('Content-Type: application/javascript');
-          if (isset($_SESSION["mailcow_cc_role"]) && $_SESSION["mailcow_cc_username"] == $object) {
-            list($req, $sigs) = $u2f->getRegisterData(get_u2f_registrations($object));
-            $_SESSION['regReq'] = json_encode($req);
-            $_SESSION['regSigs'] = json_encode($sigs);
-            echo 'var req = ' . json_encode($req) . ';';
-            echo 'var registeredKeys = ' . json_encode($sigs) . ';';
-            echo 'var appId = req.appId;';
-            echo 'var registerRequests = [{version: req.version, challenge: req.challenge}];';
-            return;
-          }
-          else {
-            return;
-          }
-        break;
-        // fido2-registration via GET
+        // fido2
         case "fido2-registration":
           header('Content-Type: application/json');
           if (isset($_SESSION["mailcow_cc_role"])) {
               // Exclude existing CredentialIds, if any
               $excludeCredentialIds = fido2(array("action" => "get_user_cids"));
-              $createArgs = $WebAuthn->getCreateArgs($_SESSION["mailcow_cc_username"], $_SESSION["mailcow_cc_username"], $_SESSION["mailcow_cc_username"], 30, true, $GLOBALS['FIDO2_UV_FLAG_REGISTER'], $excludeCredentialIds);
+              $createArgs = $WebAuthn->getCreateArgs($_SESSION["mailcow_cc_username"], $_SESSION["mailcow_cc_username"], $_SESSION["mailcow_cc_username"], 30, true, $GLOBALS['FIDO2_UV_FLAG_REGISTER'], null, $excludeCredentialIds);
               print(json_encode($createArgs));
               $_SESSION['challenge'] = $WebAuthn->getChallenge();
               return;
-          }
-          else {
-            return;
-          }
-        break;
-        case "u2f-authentication":
-          header('Content-Type: application/javascript');
-          if (isset($_SESSION['pending_mailcow_cc_username']) && $_SESSION['pending_mailcow_cc_username'] == $object) {
-            $auth_data = $u2f->getAuthenticateData(get_u2f_registrations($object));
-            $challenge = $auth_data[0]->challenge;
-            $appId = $auth_data[0]->appId;
-            foreach ($auth_data as $each) {
-              $key = array(); // Empty array
-              $key['version']   = $each->version;
-              $key['keyHandle'] = $each->keyHandle;
-              $registeredKey[]  = $key;
-            }
-            $_SESSION['authReq']  = json_encode($auth_data);
-            echo 'var appId = "' . $appId . '";';
-            echo 'var challenge = ' . json_encode($challenge) . ';';
-            echo 'var registeredKeys = ' . json_encode($registeredKey) . ';';
-            return;
           }
           else {
             return;
@@ -411,7 +415,60 @@ if (isset($_GET['query'])) {
             // return;
           // }
           $ids = NULL;
-          $getArgs = $WebAuthn->getGetArgs($ids, 30, true, true, true, true, $GLOBALS['FIDO2_UV_FLAG_LOGIN']);
+
+          $getArgs = $WebAuthn->getGetArgs($ids, 30, false, false, false, false, $GLOBALS['FIDO2_UV_FLAG_LOGIN']);
+          print(json_encode($getArgs));
+          $_SESSION['challenge'] = $WebAuthn->getChallenge();
+          return;
+        break;
+        // webauthn two factor authentication
+        case "webauthn-tfa-registration":
+          if (isset($_SESSION["mailcow_cc_role"])) {
+              // Exclude existing CredentialIds, if any
+              $stmt = $pdo->prepare("SELECT `keyHandle` FROM `tfa` WHERE username = :username AND authmech = :authmech");
+              $stmt->execute(array(
+                ':username' => $_SESSION['mailcow_cc_username'],
+                ':authmech' => 'webauthn'
+              ));
+              $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
+              while($row = array_shift($rows)) {
+                $excludeCredentialIds[] = base64_decode($row['keyHandle']);
+              }
+              // getCreateArgs($userId, $userName, $userDisplayName, $timeout=20, $requireResidentKey=false, $requireUserVerification=false, $crossPlatformAttachment=null, $excludeCredentialIds=array())
+              // cross-platform: true, if type internal is not allowed
+              //        false, if only internal is allowed
+              //        null, if internal and cross-platform is allowed
+              $createArgs = $WebAuthn->getCreateArgs($_SESSION["mailcow_cc_username"], $_SESSION["mailcow_cc_username"], $_SESSION["mailcow_cc_username"], 30, false, $GLOBALS['WEBAUTHN_UV_FLAG_REGISTER'], null, $excludeCredentialIds);
+
+              print(json_encode($createArgs));
+              $_SESSION['challenge'] = $WebAuthn->getChallenge();
+              return;
+
+          }
+          else {
+            return;
+          }
+        break;
+        case "webauthn-tfa-get-args":
+          $stmt = $pdo->prepare("SELECT `keyHandle` FROM `tfa` WHERE username = :username AND authmech = :authmech");
+          $stmt->execute(array(
+            ':username' => $_SESSION['pending_mailcow_cc_username'],
+            ':authmech' => 'webauthn'
+          ));
+          $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
+          if (count($rows) == 0) {
+            print(json_encode(array(
+                'type' => 'error',
+                'msg' => 'Cannot find matching credentialIds'
+            )));
+            exit;
+          }
+          while($row = array_shift($rows)) {
+            $cids[] = base64_decode($row['keyHandle']);
+          }
+
+          $getArgs = $WebAuthn->getGetArgs($cids, 30, false, false, false, false, $GLOBALS['WEBAUTHN_UV_FLAG_LOGIN']);
+          $getArgs->publicKey->extensions = array('appid' => "https://".$getArgs->publicKey->rpId);
           print(json_encode($getArgs));
           $_SESSION['challenge'] = $WebAuthn->getChallenge();
           return;
@@ -436,7 +493,12 @@ if (isset($_GET['query'])) {
           case "domain":
             switch ($object) {
               case "all":
-                $domains = mailbox('get', 'domains');
+                $tags = null;
+                if (isset($_GET['tags']) && $_GET['tags'] != '')
+                  $tags = explode(',', $_GET['tags']);
+
+                $domains = mailbox('get', 'domains', null, $tags);
+
                 if (!empty($domains)) {
                   foreach ($domains as $domain) {
                     if ($details = mailbox('get', 'domain_details', $domain)) {
@@ -452,7 +514,16 @@ if (isset($_GET['query'])) {
                   echo '{}';
                 }
               break;
-
+              case "template":
+                switch ($extra){
+                  case "all":
+                    process_get_return(mailbox('get', 'domain_templates'));
+                  break;
+                  default:
+                    process_get_return(mailbox('get', 'domain_templates', $extra));
+                  break;
+                }
+              break;
               default:
                 $data = mailbox('get', 'domain_details', $object);
                 process_get_return($data);
@@ -464,6 +535,15 @@ if (isset($_GET['query'])) {
             switch ($object) {
               case "html":
                 $password_complexity_rules = password_complexity('html');
+                if ($password_complexity_rules !== false) {
+                  process_get_return($password_complexity_rules);
+                }
+                else {
+                  echo '{}';
+                }
+              break;
+              default:
+                $password_complexity_rules = password_complexity('get');
                 if ($password_complexity_rules !== false) {
                   process_get_return($password_complexity_rules);
                 }
@@ -750,6 +830,34 @@ if (isset($_GET['query'])) {
             }
           break;
 
+          case "api-key":
+            switch ($object) {
+              case "all":
+                process_get_return(\Mailcow\ApiKey\ApiKeyModule::fromGlobals()->api->getKeys());
+              break;
+
+              default:
+                process_get_return(\Mailcow\ApiKey\ApiKeyModule::fromGlobals()->api->getKey($object));
+              break;
+            }
+          break;
+
+          case "mailbox-group":
+            switch ($object) {
+              case "all":
+                process_get_return(\Mailcow\MailboxGroup\MailboxGroupModule::fromGlobals()->api->getGroups($extra));
+              break;
+
+              case "member":
+                process_get_return(\Mailcow\MailboxGroup\MailboxGroupModule::fromGlobals()->api->getMemberships((string)$extra));
+              break;
+
+              default:
+                process_get_return(\Mailcow\MailboxGroup\MailboxGroupModule::fromGlobals()->api->getGroup($object));
+              break;
+            }
+          break;
+
           case "logs":
             switch ($object) {
               case "dovecot":
@@ -782,6 +890,17 @@ if (isset($_GET['query'])) {
                 }
                 else {
                   $logs = get_logs('netfilter-mailcow');
+                }
+                echo (isset($logs) && !empty($logs)) ? json_encode($logs, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT) : '{}';
+              break;
+              case "cron":
+                // 0 is first record, so empty is fine
+                if (isset($extra)) {
+                  $extra = preg_replace('/[^\d\-]/i', '', $extra);
+                  $logs = get_logs('cron-mailcow', $extra);
+                }
+                else {
+                  $logs = get_logs('cron-mailcow');
                 }
                 echo (isset($logs) && !empty($logs)) ? json_encode($logs, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT) : '{}';
               break;
@@ -902,23 +1021,20 @@ if (isset($_GET['query'])) {
             switch ($object) {
               case "all":
               case "reduced":
-                if (empty($extra)) {
-                  $domains = mailbox('get', 'domains');
-                }
-                else {
-                  $domains = explode(',', $extra);
-                }
+                $tags = null;
+                if (isset($_GET['tags']) && $_GET['tags'] != '')
+                  $tags = explode(',', $_GET['tags']);
+
+                if (empty($extra)) $domains = mailbox('get', 'domains');
+                else $domains = explode(',', $extra);
+
                 if (!empty($domains)) {
                   foreach ($domains as $domain) {
-                    $mailboxes = mailbox('get', 'mailboxes', $domain);
+                    $mailboxes = mailbox('get', 'mailboxes', $domain, $tags);
                     if (!empty($mailboxes)) {
                       foreach ($mailboxes as $mailbox) {
-                        if ($details = mailbox('get', 'mailbox_details', $mailbox, $object)) {
-                          $data[] = $details;
-                        }
-                        else {
-                          continue;
-                        }
+                        if ($details = mailbox('get', 'mailbox_details', $mailbox, $object)) $data[] = $details;
+                        else continue;
                       }
                     }
                   }
@@ -928,10 +1044,34 @@ if (isset($_GET['query'])) {
                   echo '{}';
                 }
               break;
-
+              case "template":
+                switch ($extra){
+                  case "all":
+                    process_get_return(mailbox('get', 'mailbox_templates'));
+                  break;
+                  default:
+                    process_get_return(mailbox('get', 'mailbox_templates', $extra));
+                  break;
+                }
+              break;
               default:
-                $data = mailbox('get', 'mailbox_details', $object);
-                process_get_return($data);
+                $tags = null;
+                if (isset($_GET['tags']) && $_GET['tags'] != '')
+                  $tags = explode(',', $_GET['tags']);
+
+                if ($tags === null) {
+                  $data = mailbox('get', 'mailbox_details', $object);
+                  process_get_return($data);
+                } else {
+                  $mailboxes = mailbox('get', 'mailboxes', $object, $tags);
+                  if (is_array($mailboxes)) {
+                    foreach ($mailboxes as $mailbox) {
+                      if ($details = mailbox('get', 'mailbox_details', $mailbox))
+                        $data[] = $details;
+                    }
+                  }
+                  process_get_return($data, false);
+                }
               break;
             }
           break;
@@ -962,61 +1102,37 @@ if (isset($_GET['query'])) {
             }
             process_get_return($data);
           break;
+          case "syncjob_options":
+            process_get_return(\Mailcow\Imapsync\ImapsyncModule::fromGlobals()->api->getOptions());
+          break;
+          case "imapsync_settings":
+            process_get_return(\Mailcow\Imapsync\ImapsyncModule::fromGlobals()->api->getSettings());
+          break;
+          case "syncjob_source":
+            switch ($object) {
+              case "all":
+                process_get_return(\Mailcow\Imapsync\ImapsyncModule::fromGlobals()->api->getSources());
+              break;
+              default:
+                process_get_return(\Mailcow\Imapsync\ImapsyncModule::fromGlobals()->api->getSource($object));
+              break;
+            }
+          break;
           case "syncjobs":
             switch ($object) {
               case "all":
-                $domains = mailbox('get', 'domains');
-                if (!empty($domains)) {
-                  foreach ($domains as $domain) {
-                    $mailboxes = mailbox('get', 'mailboxes', $domain);
-                    if (!empty($mailboxes)) {
-                      foreach ($mailboxes as $mailbox) {
-                        $syncjobs = mailbox('get', 'syncjobs', $mailbox);
-                        if (!empty($syncjobs)) {
-                          foreach ($syncjobs as $syncjob) {
-                            if (isset($extra)) {
-                              $details = mailbox('get', 'syncjob_details', $syncjob, explode(',', $extra));
-                            }
-                            else {
-                              $details = mailbox('get', 'syncjob_details', $syncjob);
-                            }
-                            if ($details) {
-                              $data[] = $details;
-                            }
-                            else {
-                              continue;
-                            }
-                          }
-                        }
-                      }
-                    }
+                // Admins see every job (incl. orphaned ones), others the jobs of the mailboxes they manage
+                $mailboxes = array();
+                if ($_SESSION['mailcow_cc_role'] != 'admin') {
+                  foreach (mailbox('get', 'domains') ?: array() as $domain) {
+                    $mailboxes = array_merge($mailboxes, mailbox('get', 'mailboxes', $domain) ?: array());
                   }
-                  process_get_return($data);
                 }
-                else {
-                  echo '{}';
-                }
+                process_get_return(\Mailcow\Imapsync\ImapsyncModule::fromGlobals()->api->getAllJobs($extra, $mailboxes));
               break;
 
               default:
-                $syncjobs = mailbox('get', 'syncjobs', $object);
-                if (!empty($syncjobs)) {
-                  foreach ($syncjobs as $syncjob) {
-                    if (isset($extra)) {
-                      $details = mailbox('get', 'syncjob_details', $syncjob, explode(',', $extra));
-                    }
-                    else {
-                      $details = mailbox('get', 'syncjob_details', $syncjob);
-                    }
-                    if ($details) {
-                      $data[] = $details;
-                    }
-                    else {
-                      continue;
-                    }
-                  }
-                }
-                process_get_return($data);
+                process_get_return(\Mailcow\Imapsync\ImapsyncModule::fromGlobals()->api->getJobs($object, $extra));
               break;
             }
           break;
@@ -1393,6 +1509,10 @@ if (isset($_GET['query'])) {
                   }
                   echo json_encode($temp, JSON_UNESCAPED_SLASHES);
                 break;
+                case "container":
+                  $container_stats = docker('container_stats', $extra);
+                  echo json_encode($container_stats);
+                break;
                 case "vmail":
                   $exec_fields_vmail = array('cmd' => 'system', 'task' => 'df', 'dir' => '/var/vmail');
                   $vmail_df = explode(',', json_decode(docker('post', 'dovecot-mailcow', 'exec', $exec_fields_vmail), true));
@@ -1404,26 +1524,64 @@ if (isset($_GET['query'])) {
                     'used_percent' => $vmail_df[4]
                   );
                   echo json_encode($temp, JSON_UNESCAPED_SLASHES);
-              break;
-              case "solr":
-                $solr_status = solr_status();
-                $solr_size = ($solr_status['status']['dovecot-fts']['index']['size']);
-                $solr_documents = ($solr_status['status']['dovecot-fts']['index']['numDocs']);
-                if (strtolower(getenv('SKIP_SOLR')) != 'n') {
-                  $solr_enabled = false;
-                }
-                else {
-                  $solr_enabled = true;
-                }
-                echo json_encode(array(
-                  'type' => 'info',
-                  'solr_enabled' => $solr_enabled,
-                  'solr_size' => $solr_size,
-                  'solr_documents' => $solr_documents
-                ));
-              break;
+                break;
+                case "host":
+                  if (!$extra){
+                    $stats = docker("host_stats");
+                    echo json_encode($stats);
+                  }
+                  else if ($extra == "ip") {
+                    // get public ips
+
+                    $curl = curl_init();
+                    curl_setopt($curl, CURLOPT_RETURNTRANSFER, 1);
+                    curl_setopt($curl, CURLOPT_POST, 0);
+                    curl_setopt($curl, CURLOPT_CONNECTTIMEOUT, 10);
+                    curl_setopt($curl, CURLOPT_TIMEOUT, 15);
+                    curl_setopt($curl, CURLOPT_URL, 'http://ipv4.mailcow.email');
+                    $ipv4 = curl_exec($curl);
+                    curl_setopt($curl, CURLOPT_URL, 'http://ipv6.mailcow.email');
+                    $ipv6 = curl_exec($curl);
+                    $ips = array(
+                      "ipv4" => $ipv4,
+                      "ipv6" => $ipv6
+                    );
+                    curl_close($curl);
+                    echo json_encode($ips);
+                  }
+                break;
+                case "version":
+                  echo json_encode(array(
+                    'version' => $GLOBALS['MAILCOW_GIT_VERSION']
+                  ));
+                break;
               }
             }
+          break;
+          case "spam-score":
+            $score = mailbox('get', 'spam_score', $object);
+            if ($score)
+              $score = array("score" => preg_replace("/\s+/", "", $score));
+            process_get_return($score);
+          break;
+          case "identity-provider":
+            if ($object == "sync-status") {
+              process_get_return(\Mailcow\Identity\IdentityModule::fromGlobals()->api->getStatus());
+            } elseif($_SESSION['mailcow_cc_role'] === 'admin') {
+              $iam_settings_out = $iam_settings;
+              // Read-only API keys never get the secrets of the identity provider
+              if (($_SESSION['mailcow_cc_api_access'] ?? '') == 'ro') {
+                foreach (array('client_secret', 'bindpass', 'access_token') as $iam_secret) {
+                  if (isset($iam_settings_out[$iam_secret])) $iam_settings_out[$iam_secret] = '*';
+                }
+              }
+              process_get_return($iam_settings_out);
+            } else {
+              process_get_return(null);
+            }
+          break;
+          case "identity-link":
+            process_get_return(\Mailcow\Identity\IdentityModule::fromGlobals()->api->getLink((string)$object));
           break;
         break;
         // return no route found if no case is matched
@@ -1435,6 +1593,136 @@ if (isset($_GET['query'])) {
           ));
           exit();
         }
+      }
+    break;
+    case "search":
+      function process_search_return($return) {
+        if ($return === false) {
+          echo json_encode(array(
+            'type' => 'error',
+            'msg' => 'Cannot get item'
+          ));
+        }
+        else {
+          echo json_encode($return, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT);
+        }
+      }
+      // only allow POST requests to SEARCH API endpoints
+      if ($_SERVER['REQUEST_METHOD'] != 'POST') {
+        http_response_code(405);
+        echo json_encode(array(
+          'type' => 'error',
+          'msg' => 'only POST method is allowed'
+        ));
+        exit();
+      }
+
+      // Load SSP class
+      require_once $_SERVER['DOCUMENT_ROOT'] . '/inc/lib/ssp.class.php';
+      global $pdo;
+
+      switch ($category) {
+        case "domain":
+          $table = ['domain', 'd'];
+          $primaryKey = 'domain';
+          $columns = [
+            ['db' => 'domain', 'dt' => 2],
+            ['db' => 'aliases', 'dt' => 3, 'order_subquery' => "SELECT COUNT(*) FROM `alias` WHERE (`domain`= `d`.`domain` OR `domain` IN (SELECT `alias_domain` FROM `alias_domain` WHERE `target_domain` = `d`.`domain`)) AND `address` NOT IN (SELECT `username` FROM `mailbox`)"],
+            ['db' => 'mailboxes', 'dt' => 4, 'order_subquery' => "SELECT COUNT(*) FROM `mailbox` WHERE `mailbox`.`domain` = `d`.`domain` AND (`mailbox`.`kind` = '' OR `mailbox`.`kind` = NULL)"],
+            ['db' => 'quota', 'dt' => 5, 'order_subquery' => "SELECT COALESCE(SUM(`mailbox`.`quota`), 0) FROM `mailbox` WHERE `mailbox`.`domain` = `d`.`domain` AND (`mailbox`.`kind` = '' OR `mailbox`.`kind` = NULL)"],
+            ['db' => 'stats', 'dt' => 6, 'dummy' => true, 'order_subquery' => "SELECT SUM(bytes) FROM `quota2` WHERE `quota2`.`username` IN (SELECT `username` FROM `mailbox` WHERE `domain` = `d`.`domain`)"],
+            ['db' => 'defquota', 'dt' => 7],
+            ['db' => 'maxquota', 'dt' => 8],
+            ['db' => 'backupmx', 'dt' => 10],
+            ['db' => 'tags', 'dt' => 14, 'dummy' => true, 'search' => ['join' => 'LEFT JOIN `tags_domain` AS `td` ON `td`.`domain` = `d`.`domain`', 'where_column' => '`td`.`tag_name`']],
+            ['db' => 'active', 'dt' => 15],
+          ];
+
+          if($_SESSION['mailcow_cc_role'] === 'admin') {
+            $data = SSP::simple($requestDecoded, $pdo, $table, $primaryKey, $columns);
+          } elseif ($_SESSION['mailcow_cc_role'] === 'domainadmin') {
+            $data = SSP::complex($requestDecoded, $pdo, $table, $primaryKey, $columns,
+              'INNER JOIN domain_admins as da ON da.domain = d.domain',
+              [
+                'condition' => 'da.active = 1 and da.username = :username',
+                'bindings' => ['username' => $_SESSION['mailcow_cc_username']]
+              ]);
+          } else {
+            http_response_code(403);
+            echo json_encode(array(
+              'type' => 'error',
+              'msg' => 'Insufficient permissions'
+            ));
+            exit();
+          }
+
+          if (!empty($data['data'])) {
+            $domainsData = [];
+            foreach ($data['data'] as $domain) {
+              if ($details = mailbox('get', 'domain_details', $domain[2])) {
+                $domainsData[] = $details;
+              }
+            }
+            $data['data'] = $domainsData;
+          }
+
+          process_search_return($data);
+        break;
+
+        case "mailbox":
+          $table = ['mailbox', 'm'];
+          $primaryKey = 'username';
+          $columns = [
+            ['db' => 'username', 'dt' => 2],
+            ['db' => 'quota', 'dt' => 3],
+            ['db' => 'last_mail_login', 'dt' => 4, 'dummy' => true, 'order_subquery' => "SELECT MAX(`datetime`) FROM `sasl_log` WHERE `service` != 'SSO' AND `username` = `m`.`username`"],
+            ['db' => 'last_pw_change', 'dt' => 5, 'dummy' => true, 'order_subquery' => "JSON_EXTRACT(attributes, '$.passwd_update')"],
+            ['db' => 'in_use', 'dt' => 6, 'dummy' => true, 'order_subquery' => "(SELECT SUM(bytes) FROM `quota2` WHERE `quota2`.`username` = `m`.`username`) / `m`.`quota`"],
+            ['db' => 'name', 'dt' => 7],
+            ['db' => 'messages', 'dt' => 20, 'dummy' => true, 'order_subquery' => "SELECT SUM(messages) FROM `quota2` WHERE `quota2`.`username` = `m`.`username`"],
+            ['db' => 'tags', 'dt' => 23, 'dummy' => true, 'search' => ['join' => 'LEFT JOIN `tags_mailbox` AS `tm` ON `tm`.`username` = `m`.`username`', 'where_column' => '`tm`.`tag_name`']],
+            ['db' => 'active', 'dt' => 24],
+          ];
+
+          if($_SESSION['mailcow_cc_role'] === 'admin') {
+            $data = SSP::complex($requestDecoded, $pdo, $table, $primaryKey, $columns, null,
+              "(`m`.`kind` = '' OR `m`.`kind` = NULL)");
+          } elseif ($_SESSION['mailcow_cc_role'] === 'domainadmin') {
+            $data = SSP::complex($requestDecoded, $pdo, $table, $primaryKey, $columns,
+              'INNER JOIN domain_admins as da ON da.domain = m.domain',
+              [
+                'condition' => "(`m`.`kind` = '' OR `m`.`kind` = NULL) AND `da`.`active` = 1 AND `da`.`username` = :username",
+                'bindings' => ['username' => $_SESSION['mailcow_cc_username']]
+              ]);
+          } else {
+            http_response_code(403);
+            echo json_encode(array(
+              'type' => 'error',
+              'msg' => 'Insufficient permissions'
+            ));
+            exit();
+          }
+
+          if (!empty($data['data'])) {
+            $mailboxData = [];
+            foreach ($data['data'] as $mailbox) {
+              if ($details = mailbox('get', 'mailbox_details', $mailbox[2])) {
+                $mailboxData[] = $details;
+              }
+            }
+            $data['data'] = $mailboxData;
+          }
+
+          process_search_return($data);
+        break;
+
+        default:
+          http_response_code(404);
+          echo json_encode(array(
+            'type' => 'error',
+            'msg' => 'Invalid search category'
+          ));
+        break;
       }
     break;
     case "delete":
@@ -1485,6 +1773,12 @@ if (isset($_GET['query'])) {
         case "oauth2-client":
           process_delete_return(oauth2('delete', 'client', array('id' => $items)));
         break;
+        case "api-key":
+          process_delete_return(\Mailcow\ApiKey\ApiKeyModule::fromGlobals()->api->deleteKeys($items));
+        break;
+        case "mailbox-group":
+          process_delete_return(\Mailcow\MailboxGroup\MailboxGroupModule::fromGlobals()->api->deleteGroups($items));
+        break;
         case "app-passwd":
           process_delete_return(app_passwd('delete', array('id' => $items)));
         break;
@@ -1498,7 +1792,10 @@ if (isset($_GET['query'])) {
           process_delete_return(rsettings('delete', array('id' => $items)));
         break;
         case "syncjob":
-          process_delete_return(mailbox('delete', 'syncjob', array('id' => $items)));
+          process_delete_return(\Mailcow\Imapsync\ImapsyncModule::fromGlobals()->api->deleteJobs($items));
+        break;
+        case "syncjob_source":
+          process_delete_return(\Mailcow\Imapsync\ImapsyncModule::fromGlobals()->api->deleteSources($items));
         break;
         case "filter":
           process_delete_return(mailbox('delete', 'filter', array('id' => $items)));
@@ -1525,13 +1822,31 @@ if (isset($_GET['query'])) {
           process_delete_return(dkim('delete', array('domains' => $items)));
         break;
         case "domain":
-          process_delete_return(mailbox('delete', 'domain', array('domain' => $items)));
+          switch ($object){
+            case "tag":
+              process_delete_return(mailbox('delete', 'tags_domain', array('tags' => $items, 'domain' => $extra)));
+            break;
+            case "template":
+              process_delete_return(mailbox('delete', 'domain_templates', array('ids' => $items)));
+            break;
+            default:
+              process_delete_return(mailbox('delete', 'domain', array('domain' => $items)));
+          }
         break;
         case "alias-domain":
           process_delete_return(mailbox('delete', 'alias_domain', array('alias_domain' => $items)));
         break;
         case "mailbox":
-          process_delete_return(mailbox('delete', 'mailbox', array('username' => $items)));
+          switch ($object){
+            case "tag":
+              process_delete_return(mailbox('delete', 'tags_mailbox', array('tags' => $items, 'username' => $extra)));
+            break;
+            case "template":
+              process_delete_return(mailbox('delete', 'mailbox_templates', array('ids' => $items)));
+            break;
+            default:
+              process_delete_return(mailbox('delete', 'mailbox', array('username' => $items)));
+          }
         break;
         case "resource":
           process_delete_return(mailbox('delete', 'resource', array('name' => $items)));
@@ -1559,6 +1874,12 @@ if (isset($_GET['query'])) {
         break;
         case "rlhash":
           echo ratelimit('delete', null, implode($items));
+        break;
+        case "identity-provider":
+          process_delete_return(identity_provider('delete'));
+        break;
+        case "identity-link":
+          process_delete_return(\Mailcow\Identity\IdentityModule::fromGlobals()->api->unlink($items));
         break;
         // return no route found if no case is matched
         default:
@@ -1626,6 +1947,12 @@ if (isset($_GET['query'])) {
         case "oauth2-client":
           process_edit_return(oauth2('edit', 'client', array_merge(array('id' => $items), $attr)));
         break;
+        case "api-key":
+          process_edit_return(\Mailcow\ApiKey\ApiKeyModule::fromGlobals()->api->editKeys($items, $attr));
+        break;
+        case "mailbox-group":
+          process_edit_return(\Mailcow\MailboxGroup\MailboxGroupModule::fromGlobals()->api->editGroups($items, $attr));
+        break;
         case "recipient_map":
           process_edit_return(recipient_map('edit', array_merge(array('id' => $items), $attr)));
         break;
@@ -1690,10 +2017,40 @@ if (isset($_GET['query'])) {
           process_edit_return(mailbox('edit', 'time_limited_alias', array_merge(array('address' => $items), $attr)));
         break;
         case "mailbox":
-          process_edit_return(mailbox('edit', 'mailbox', array_merge(array('username' => $items), $attr)));
+          switch ($object) {
+            case "template":
+              process_edit_return(mailbox('edit', 'mailbox_templates', array_merge(array('ids' => $items), $attr)));
+            break;
+            case "custom-attribute":
+              process_edit_return(mailbox('edit', 'mailbox_custom_attribute', array_merge(array('mailboxes' => $items), $attr)));
+            break;
+            default:
+              process_edit_return(mailbox('edit', 'mailbox', array_merge(array('username' => $items), $attr)));
+            break;
+          }
         break;
         case "syncjob":
-          process_edit_return(mailbox('edit', 'syncjob', array_merge(array('id' => $items), $attr)));
+          switch ($object) {
+            case "run_next":
+              process_edit_return(\Mailcow\Imapsync\ImapsyncModule::fromGlobals()->api->runNext($items));
+            break;
+            default:
+              process_edit_return(\Mailcow\Imapsync\ImapsyncModule::fromGlobals()->api->editJobs($items, $attr));
+            break;
+          }
+        break;
+        case "imapsync_settings":
+          process_edit_return(\Mailcow\Imapsync\ImapsyncModule::fromGlobals()->api->editSettings($attr));
+        break;
+        case "syncjob_source":
+          switch ($object) {
+            case "refresh_token":
+              process_edit_return(\Mailcow\Imapsync\ImapsyncModule::fromGlobals()->api->refreshSourceToken($items));
+            break;
+            default:
+              process_edit_return(\Mailcow\Imapsync\ImapsyncModule::fromGlobals()->api->editSources($items, $attr));
+            break;
+          }
         break;
         case "filter":
           process_edit_return(mailbox('edit', 'filter', array_merge(array('id' => $items), $attr)));
@@ -1702,13 +2059,26 @@ if (isset($_GET['query'])) {
           process_edit_return(mailbox('edit', 'resource', array_merge(array('name' => $items), $attr)));
         break;
         case "domain":
-          process_edit_return(mailbox('edit', 'domain', array_merge(array('domain' => $items), $attr)));
+          switch ($object) {
+            case "template":
+              process_edit_return(mailbox('edit', 'domain_templates', array_merge(array('ids' => $items), $attr)));
+            break;
+            case "footer":
+              process_edit_return(mailbox('edit', 'domain_wide_footer', array_merge(array('domains' => $items), $attr)));
+            break;
+            default:
+              process_edit_return(mailbox('edit', 'domain', array_merge(array('domain' => $items), $attr)));
+            break;
+          }
         break;
         case "rl-domain":
           process_edit_return(ratelimit('edit', 'domain', array_merge(array('object' => $items), $attr)));
         break;
         case "rl-mbox":
           process_edit_return(ratelimit('edit', 'mailbox', array_merge(array('object' => $items), $attr)));
+        break;
+        case "rename-mbox":
+          process_edit_return(mailbox('edit', 'mailbox_rename', array_merge(array('mailbox' => $items), $attr)));
         break;
         case "user-acl":
           process_edit_return(acl('edit', 'user', array_merge(array('username' => $items), $attr)));
@@ -1732,10 +2102,26 @@ if (isset($_GET['query'])) {
           process_edit_return(fwdhost('edit', array_merge(array('fwdhost' => $items), $attr)));
         break;
         case "fail2ban":
-          process_edit_return(fail2ban('edit', array_merge(array('network' => $items), $attr)));
+          switch ($object) {
+            case 'banlist':
+              process_edit_return(fail2ban('banlist', 'refresh', $items));
+            break;
+            default:
+              process_edit_return(fail2ban('edit', array_merge(array('network' => $items), $attr)));
+            break;
+          }
         break;
         case "ui_texts":
           process_edit_return(customize('edit', 'ui_texts', $attr));
+        break;
+        case "ip_check":
+          process_edit_return(customize('edit', 'ip_check', $attr));
+        break;
+        case "custom_login":
+          process_edit_return(customize('edit', 'custom_login', $attr));
+        break;
+        case "ui_theme":
+          process_edit_return(customize('edit', 'ui_theme', $attr));
         break;
         case "self":
           if ($_SESSION['mailcow_cc_role'] == "domainadmin") {
@@ -1744,6 +2130,27 @@ if (isset($_GET['query'])) {
           elseif ($_SESSION['mailcow_cc_role'] == "user") {
             process_edit_return(edit_user_account($attr));
           }
+        break;
+        case "cors":
+          process_edit_return(cors('edit', $attr));
+        break;
+        case "identity-provider":
+          process_edit_return(identity_provider('edit', $attr));
+        break;
+        case "identity-provider-test":
+          process_edit_return(identity_provider('test', $attr));
+        break;
+        case "identity-provider-sync":
+          process_edit_return(\Mailcow\Identity\IdentityModule::fromGlobals()->api->requestRun($attr));
+        break;
+        case "cors":
+          process_edit_return(cors('edit', $attr));
+        break;
+        case "reset-password-notification":
+          process_edit_return(reset_password('edit_notification', $attr));
+        break;
+        case "mta-sts":
+          process_edit_return(mailbox('edit', 'mta_sts', array_merge(array('domains' => $items), $attr)));
         break;
         // return no route found if no case is matched
         default:
@@ -1765,7 +2172,7 @@ if (isset($_GET['query'])) {
       exit();
   }
 }
-if ($_SESSION['mailcow_cc_api'] === true) {
+if (array_key_exists('mailcow_cc_api', $_SESSION) && $_SESSION['mailcow_cc_api'] === true) {
   if (isset($_SESSION['mailcow_cc_api']) && $_SESSION['mailcow_cc_api'] === true) {
     unset($_SESSION['return']);
   }

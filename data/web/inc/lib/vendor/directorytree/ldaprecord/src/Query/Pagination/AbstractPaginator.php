@@ -9,38 +9,28 @@ abstract class AbstractPaginator
 {
     /**
      * The query builder instance.
-     *
-     * @var Builder
      */
-    protected $query;
+    protected Builder $query;
 
     /**
      * The filter to execute.
-     *
-     * @var string
      */
-    protected $filter;
+    protected string $filter;
 
     /**
      * The amount of objects to fetch per page.
-     *
-     * @var int
      */
-    protected $perPage;
+    protected int $perPage;
 
     /**
      * Whether the operation is critical.
-     *
-     * @var bool
      */
-    protected $isCritical;
+    protected bool $isCritical;
 
     /**
      * Constructor.
-     *
-     * @param Builder $query
      */
-    public function __construct(Builder $query, $filter, $perPage, $isCritical)
+    public function __construct(Builder $query, string $filter, int $perPage, bool $isCritical = false)
     {
         $this->query = $query;
         $this->filter = $filter;
@@ -50,12 +40,8 @@ abstract class AbstractPaginator
 
     /**
      * Execute the pagination request.
-     *
-     * @param LdapInterface $ldap
-     *
-     * @return array
      */
-    public function execute(LdapInterface $ldap)
+    public function execute(LdapInterface $ldap): mixed
     {
         $pages = [];
 
@@ -71,7 +57,7 @@ abstract class AbstractPaginator
             $this->updateServerControls($ldap, $resource);
 
             $pages[] = $this->query->parse($resource);
-        } while (! empty($this->fetchCookie()));
+        } while ($this->shouldContinue());
 
         $this->resetServerControls($ldap);
 
@@ -79,44 +65,37 @@ abstract class AbstractPaginator
     }
 
     /**
-     * Fetch the pagination cookie.
-     *
-     * @return string
+     * Whether the paginator should continue iterating.
      */
-    abstract protected function fetchCookie();
+    protected function shouldContinue(): bool
+    {
+        $cookie = $this->fetchCookie();
+
+        return $cookie !== '';
+    }
+
+    /**
+     * Fetch the pagination cookie.
+     */
+    abstract protected function fetchCookie(): ?string;
 
     /**
      * Prepare the server controls before executing the pagination request.
-     *
-     * @return void
      */
-    abstract protected function prepareServerControls();
+    abstract protected function prepareServerControls(): void;
 
     /**
      * Apply the server controls.
-     *
-     * @param LdapInterface $ldap
-     *
-     * @return void
      */
-    abstract protected function applyServerControls(LdapInterface $ldap);
+    abstract protected function applyServerControls(LdapInterface $ldap): void;
 
     /**
      * Reset the server controls.
-     *
-     * @param LdapInterface $ldap
-     *
-     * @return mixed
      */
-    abstract protected function resetServerControls(LdapInterface $ldap);
+    abstract protected function resetServerControls(LdapInterface $ldap): void;
 
     /**
      * Update the server controls.
-     *
-     * @param LdapInterface $ldap
-     * @param resource      $resource
-     *
-     * @return void
      */
-    abstract protected function updateServerControls(LdapInterface $ldap, $resource);
+    abstract protected function updateServerControls(LdapInterface $ldap, mixed $resource): void;
 }

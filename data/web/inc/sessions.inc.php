@@ -1,11 +1,15 @@
 <?php
 // Start session
 if (session_status() !== PHP_SESSION_ACTIVE) {
+  session_name($SESSION_NAME);
   ini_set("session.cookie_httponly", 1);
+  ini_set("session.cookie_samesite", $SESSION_SAMESITE_POLICY);
   ini_set('session.gc_maxlifetime', $SESSION_LIFETIME);
 }
 
-if (isset($_SERVER['HTTP_X_FORWARDED_PROTO']) && 
+$_SESSION['access_all_exception'] = '0';
+
+if (isset($_SERVER['HTTP_X_FORWARDED_PROTO']) &&
   strtolower($_SERVER['HTTP_X_FORWARDED_PROTO']) == "https") {
   if (session_status() !== PHP_SESSION_ACTIVE) {
     ini_set("session.cookie_secure", 1);
@@ -63,6 +67,9 @@ if (!empty($_SERVER['HTTP_X_API_KEY'])) {
       else {
         $_SESSION['mailcow_cc_api_access'] = 'ro';
       }
+      // Bind the session to this key, see the check below
+      $_SESSION['mailcow_cc_api_key_id'] = $api_return['id'];
+      $_SESSION['mailcow_cc_api_key_hash'] = hash('sha256', $api_return['api_key']);
     }
     else {
       $redis->publish("F2B_CHANNEL", "mailcow UI: Invalid password for API_USER by " . $_SERVER['REMOTE_ADDR']);
@@ -88,22 +95,59 @@ if (!empty($_SERVER['HTTP_X_API_KEY'])) {
     exit();
   }
 }
+elseif (!empty($_SESSION['mailcow_cc_api'])) {
+  // API session without header: end it when its key was deleted, deactivated, regenerated or its access changed
+  if (!isset($pdo)) {
+    // sogo-auth.php (nginx auth_request) loads no prerequisites
+    $pdo = new PDO($database_type . ":unix_socket=" . $database_sock . ";dbname=" . $database_name, $database_user, $database_pass, array(
+      PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+      PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+      PDO::ATTR_EMULATE_PREPARES => false,
+    ));
+  }
+  $stmt = $pdo->prepare("SELECT `api_key`, `access` FROM `api` WHERE `id` = :id AND `active` = '1';");
+  $stmt->execute(array(':id' => intval($_SESSION['mailcow_cc_api_key_id'] ?? 0)));
+  $api_return = $stmt->fetch(PDO::FETCH_ASSOC);
+  if (empty($api_return['api_key']) ||
+    !hash_equals((string)($_SESSION['mailcow_cc_api_key_hash'] ?? ''), hash('sha256', $api_return['api_key'])) ||
+    $api_return['access'] != ($_SESSION['mailcow_cc_api_access'] ?? '')) {
+    session_unset();
+    session_destroy();
+  }
+}
 
 // Handle logouts
 if (isset($_POST["logout"])) {
   if (isset($_SESSION["dual-login"])) {
     $_SESSION["mailcow_cc_username"] = $_SESSION["dual-login"]["username"];
     $_SESSION["mailcow_cc_role"] = $_SESSION["dual-login"]["role"];
+    unset($_SESSION['sogo-sso-user-allowed']);
+    unset($_SESSION['sogo-sso-pass']);
     unset($_SESSION["dual-login"]);
-    header("Location: /mailbox");
+    if ($_SESSION["mailcow_cc_role"] == "admin"){
+      header("Location: /admin/mailbox");
+    } elseif ($_SESSION["mailcow_cc_role"] == "domainadmin") {
+      header("Location: /domainadmin/mailbox");
+    } else {
+      header("Location: /");
+    }
     exit();
   }
   else {
+    $role = $_SESSION["mailcow_cc_role"];
     session_regenerate_id(true);
     session_unset();
     session_destroy();
     session_write_close();
-    header("Location: /");
+    if ($role == "admin") {
+      header("Location: /admin");
+    }
+    elseif ($role == "domainadmin") {
+      header("Location: /domainadmin");
+    }
+    else {
+      header("Location: /");
+    }
   }
 }
 
@@ -119,17 +163,32 @@ function session_check() {
     );
     return false;
   }
-  if (!empty($_POST)) {
-    if ($_SESSION['CSRF']['TOKEN'] != $_POST['csrf_token']) {
-      $_SESSION['return'][] = array(
-        'type' => 'warning',
-        'msg' => 'session_token'
-      );
-      return false;
+  // Check if this is a POST request (form-encoded or JSON)
+  $is_post_request = !empty($_POST) || (
+    isset($_SERVER['CONTENT_TYPE']) &&
+    strpos($_SERVER['CONTENT_TYPE'], 'application/json') !== false
+  );
+
+  if ($is_post_request) {
+    // Skip CSRF check for DataTables server-side processing endpoints
+    // These are read-only operations (equivalent to GET) authenticated by session
+    $is_search_endpoint = (
+      isset($_GET['query']) &&
+      preg_match('#^search/(domain|mailbox)$#', $_GET['query'])
+    );
+
+    if (!$is_search_endpoint && !empty($_POST)) {
+      if ($_SESSION['CSRF']['TOKEN'] != $_POST['csrf_token']) {
+        $_SESSION['return'][] = array(
+          'type' => 'warning',
+          'msg' => 'session_token'
+        );
+        return false;
+      }
+      unset($_POST['csrf_token']);
+      $_SESSION['CSRF']['TOKEN'] = bin2hex(random_bytes(32));
+      $_SESSION['CSRF']['TIME'] = time();
     }
-    unset($_POST['csrf_token']);
-    $_SESSION['CSRF']['TOKEN'] = bin2hex(random_bytes(32));
-    $_SESSION['CSRF']['TIME'] = time();
   }
   return true;
 }

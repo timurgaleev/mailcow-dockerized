@@ -12,6 +12,10 @@ if (!isset($_SESSION['mailcow_cc_role']) || $_SESSION['mailcow_cc_role'] != 'use
   header('Location: index.php?mobileconfig' . $append_get);
   die();
 }
+if (!empty($_SESSION['pending_tfa_setup']) || !empty($_SESSION['pending_pw_update'])) {
+  header('Location: /');
+  die();
+}
 
 error_reporting(0);
 
@@ -34,15 +38,15 @@ catch(PDOException $e) {
 
 if (isset($_GET['only_email'])) {
   $onlyEmailAccount = true;
-  $description = 'IMAP';  
+  $description = 'IMAP';
 } else {
   $onlyEmailAccount = false;
-  $description = 'IMAP, CalDAV, CardDAV'; 
+  $description = 'IMAP, CalDAV, CardDAV';
 }
-if (isset($_GET['app_password'])) {
+if (isset($_GET['app_password']) && ($_SESSION['acl']['app_passwds'] ?? '0') == '1') {
   $app_password = true;
   $description .= ' with application password';
-  
+
   if (strpos($_SERVER['HTTP_USER_AGENT'], 'iPad') !== FALSE)
       $platform = 'iPad';
   elseif (strpos($_SERVER['HTTP_USER_AGENT'], 'iPhone') !== FALSE)
@@ -51,8 +55,9 @@ if (isset($_GET['app_password'])) {
       $platform = 'Mac';
   else
       $platform = $_SERVER['HTTP_USER_AGENT'];
-  
-  $password = bin2hex(openssl_random_pseudo_bytes(16));
+
+  $password = password_generate();
+
   $attr = array(
       'app_name' => $platform,
       'app_passwd' => $password,
@@ -64,6 +69,7 @@ if (isset($_GET['app_password'])) {
       $attr['protocols'][] = 'dav_access';
   }
   app_passwd("add", $attr);
+  $password = htmlspecialchars($password, ENT_NOQUOTES);
 } else {
   $app_password = false;
 }

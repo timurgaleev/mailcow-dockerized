@@ -1,5 +1,10 @@
 #!/bin/bash
 
+if [ "${DEV_MODE}" != "n" ]; then
+  echo -e "\e[31mEnabled Debug Mode\e[0m"
+  set -x
+fi
+
 trap "exit" INT TERM
 trap "kill 0" EXIT
 
@@ -19,9 +24,11 @@ fi
 
 if [[ "${WATCHDOG_VERBOSE}" =~ ^([yY][eE][sS]|[yY])+$ ]]; then
   SMTP_VERBOSE="--verbose"
+  CURL_VERBOSE="--verbose"
   set -xv
 else
   SMTP_VERBOSE=""
+  CURL_VERBOSE=""
   exec 2>/dev/null
 fi
 
@@ -31,16 +38,29 @@ if [[ ! -p /tmp/com_pipe ]]; then
 fi
 
 # Wait for containers
-while ! mysqladmin status --socket=/var/run/mysqld/mysqld.sock -u${DBUSER} -p${DBPASS} --silent; do
+while ! mariadb-admin status --skip-ssl --socket=/var/run/mysqld/mysqld.sock -u${DBUSER} -p${DBPASS} --silent; do
   echo "Waiting for SQL..."
   sleep 2
 done
 
+# Wait for the schema update (DB_VERSION) at startup, do not restart them meanwhile.
+DBV_NOW=$(mariadb --skip-ssl --socket=/var/run/mysqld/mysqld.sock -u${DBUSER} -p${DBPASS} ${DBNAME} -e "SELECT version FROM versions WHERE application = 'db_schema';" -BN)
+DBV_WAIT=0
+while [[ "${DBV_NOW}" != "${DB_VERSION}" ]] && [[ ${DBV_WAIT} -lt 60 ]]; do
+  echo "Waiting for schema update..."
+  sleep 5
+  DBV_WAIT=$((DBV_WAIT + 1))
+  DBV_NOW=$(mariadb --skip-ssl --socket=/var/run/mysqld/mysqld.sock -u${DBUSER} -p${DBPASS} ${DBNAME} -e "SELECT version FROM versions WHERE application = 'db_schema';" -BN)
+done
+if [[ "${DBV_NOW}" != "${DB_VERSION}" ]]; then
+  echo -e "\e[31m$(date) - DB schema is ${DBV_NOW}, expected ${DB_VERSION} - starting checks anyway, check the php-fpm log (init_db)\e[0m"
+fi
+
 # Do not attempt to write to slave
 if [[ ! -z ${REDIS_SLAVEOF_IP} ]]; then
-  REDIS_CMDLINE="redis-cli -h ${REDIS_SLAVEOF_IP} -p ${REDIS_SLAVEOF_PORT}"
+  REDIS_CMDLINE="redis-cli -h ${REDIS_SLAVEOF_IP} -p ${REDIS_SLAVEOF_PORT} -a ${REDISPASS} --no-auth-warning"
 else
-  REDIS_CMDLINE="redis-cli -h redis -p 6379"
+  REDIS_CMDLINE="redis-cli -h redis -p 6379 -a ${REDISPASS} --no-auth-warning"
 fi
 
 until [[ $(${REDIS_CMDLINE} PING) == "PONG" ]]; do
@@ -97,7 +117,9 @@ log_msg() {
   echo $(date) $(printf '%s\n' "${1}")
 }
 
-function mail_error() {
+function notify_error() {
+  # Check if one of the notification options is enabled
+  [[ -z ${WATCHDOG_NOTIFY_EMAIL} ]] && [[ -z ${WATCHDOG_NOTIFY_WEBHOOK} ]] && return 0
   THROTTLE=
   [[ -z ${1} ]] && return 1
   # If exists, body will be the content of "/tmp/${1}", even if ${2} is set
@@ -122,37 +144,61 @@ function mail_error() {
   else
     SUBJECT="${WATCHDOG_SUBJECT}: ${1}"
   fi
-  IFS=',' read -r -a MAIL_RCPTS <<< "${WATCHDOG_NOTIFY_EMAIL}"
-  for rcpt in "${MAIL_RCPTS[@]}"; do
-    RCPT_DOMAIN=
-    RCPT_MX=
-    RCPT_DOMAIN=$(echo ${rcpt} | awk -F @ {'print $NF'})
-    CHECK_FOR_VALID_MX=$(dig +short ${RCPT_DOMAIN} mx)
-    if [[ -z ${CHECK_FOR_VALID_MX} ]]; then
-      log_msg "Cannot determine MX for ${rcpt}, skipping email notification..."
+
+  # Send mail notification if enabled
+  if [[ ! -z ${WATCHDOG_NOTIFY_EMAIL} ]]; then
+    IFS=',' read -r -a MAIL_RCPTS <<< "${WATCHDOG_NOTIFY_EMAIL}"
+    for rcpt in "${MAIL_RCPTS[@]}"; do
+      RCPT_DOMAIN=
+      RCPT_MX=
+      RCPT_DOMAIN=$(echo ${rcpt} | awk -F @ {'print $NF'})
+      CHECK_FOR_VALID_MX=$(dig +short ${RCPT_DOMAIN} mx)
+      if [[ -z ${CHECK_FOR_VALID_MX} ]]; then
+        log_msg "Cannot determine MX for ${rcpt}, skipping email notification..."
+        return 1
+      fi
+      [ -f "/tmp/${1}" ] && BODY="/tmp/${1}"
+      timeout 10s ./smtp-cli --missing-modules-ok \
+        "${SMTP_VERBOSE}" \
+        --charset=UTF-8 \
+        --subject="${SUBJECT}" \
+        --body-plain="${BODY}" \
+        --add-header="X-Priority: 1" \
+        --to=${rcpt} \
+        --from="watchdog@${MAILCOW_HOSTNAME}" \
+        --hello-host=${MAILCOW_HOSTNAME} \
+        --ipv4
+      if [[ $? -eq 1 ]]; then # exit code 1 is fine
+        log_msg "Sent notification email to ${rcpt}"
+      else
+        if [[ "${SMTP_VERBOSE}" == "" ]]; then
+          log_msg "Error while sending notification email to ${rcpt}. You can enable verbose logging by setting 'WATCHDOG_VERBOSE=y' in mailcow.conf."
+        else
+          log_msg "Error while sending notification email to ${rcpt}."
+        fi
+      fi
+    done
+  fi
+
+  # Send webhook notification if enabled
+  if [[ ! -z ${WATCHDOG_NOTIFY_WEBHOOK} ]]; then
+    if [[ -z ${WATCHDOG_NOTIFY_WEBHOOK_BODY} ]]; then
+      log_msg "No webhook body set, skipping webhook notification..."
       return 1
     fi
-    [ -f "/tmp/${1}" ] && BODY="/tmp/${1}"
-    timeout 10s ./smtp-cli --missing-modules-ok \
-      "${SMTP_VERBOSE}" \
-      --charset=UTF-8 \
-      --subject="${SUBJECT}" \
-      --body-plain="${BODY}" \
-      --add-header="X-Priority: 1" \
-      --to=${rcpt} \
-      --from="watchdog@${MAILCOW_HOSTNAME}" \
-      --hello-host=${MAILCOW_HOSTNAME} \
-      --ipv4
-    if [[ $? -eq 1 ]]; then # exit code 1 is fine
-      log_msg "Sent notification email to ${rcpt}"
-    else
-      if [[ "${SMTP_VERBOSE}" == "" ]]; then
-        log_msg "Error while sending notification email to ${rcpt}. You can enable verbose logging by setting 'WATCHDOG_VERBOSE=y' in mailcow.conf."
-      else
-        log_msg "Error while sending notification email to ${rcpt}."
-      fi
-    fi
-  done
+
+    # Escape subject and body (https://stackoverflow.com/a/2705678)
+    ESCAPED_SUBJECT=$(echo ${SUBJECT} | sed -e 's/[\/&]/\\&/g')
+    ESCAPED_BODY=$(echo ${BODY} | sed -e 's/[\/&]/\\&/g')
+
+    # Replace subject and body placeholders
+    WEBHOOK_BODY=$(echo ${WATCHDOG_NOTIFY_WEBHOOK_BODY} | sed -e "s/\$SUBJECT\|\${SUBJECT}/$ESCAPED_SUBJECT/g" -e "s/\$BODY\|\${BODY}/$ESCAPED_BODY/g")
+
+    # POST to webhook
+    curl -X POST -H "Content-Type: application/json" ${CURL_VERBOSE} -d "${WEBHOOK_BODY}" ${WATCHDOG_NOTIFY_WEBHOOK}
+
+    log_msg "Sent notification using webhook"
+  fi
 }
 
 get_container_ip() {
@@ -167,12 +213,12 @@ get_container_ip() {
     else
       sleep 0.5
       # get long container id for exact match
-      CONTAINER_ID=($(curl --silent --insecure https://dockerapi/containers/json | jq -r ".[] | {name: .Config.Labels[\"com.docker.compose.service\"], project: .Config.Labels[\"com.docker.compose.project\"], id: .Id}" | jq -rc "select( .name | tostring == \"${1}\") | select( .project | tostring | contains(\"${COMPOSE_PROJECT_NAME,,}\")) | .id"))
+      CONTAINER_ID=($(curl --silent --insecure https://dockerapi.${COMPOSE_PROJECT_NAME}_mailcow-network/containers/json | jq -r ".[] | {name: .Config.Labels[\"com.docker.compose.service\"], project: .Config.Labels[\"com.docker.compose.project\"], id: .Id}" | jq -rc "select( .name | tostring == \"${1}\") | select( .project | tostring | contains(\"${COMPOSE_PROJECT_NAME,,}\")) | .id"))
       # returned id can have multiple elements (if scaled), shuffle for random test
       CONTAINER_ID=($(printf "%s\n" "${CONTAINER_ID[@]}" | shuf))
       if [[ ! -z ${CONTAINER_ID} ]]; then
         for matched_container in "${CONTAINER_ID[@]}"; do
-          CONTAINER_IPS=($(curl --silent --insecure https://dockerapi/containers/${matched_container}/json | jq -r '.NetworkSettings.Networks[].IPAddress'))
+          CONTAINER_IPS=($(curl --silent --insecure https://dockerapi.${COMPOSE_PROJECT_NAME}_mailcow-network/containers/${matched_container}/json | jq -r '.NetworkSettings.Networks[].IPAddress'))
           for ip_match in "${CONTAINER_IPS[@]}"; do
             # grep will do nothing if one of these vars is empty
             [[ -z ${ip_match} ]] && continue
@@ -197,7 +243,7 @@ get_container_ip() {
 # One-time check
 if grep -qi "$(echo ${IPV6_NETWORK} | cut -d: -f1-3)" <<< "$(ip a s)"; then
   if [[ -z "$(get_ipv6)" ]]; then
-    mail_error "ipv6-config" "enable_ipv6 is true in docker-compose.yml, but an IPv6 link could not be established. Please verify your IPv6 connection."
+    notify_error "ipv6-config" "enable_ipv6 is true in docker-compose.yml, but an IPv6 link could not be established. Please verify your IPv6 connection."
   fi
 fi
 
@@ -206,7 +252,7 @@ external_checks() {
   diff_c=0
   THRESHOLD=${EXTERNAL_CHECKS_THRESHOLD}
   # Reduce error count by 2 after restarting an unhealthy container
-  GUID=$(mysql -u${DBUSER} -p${DBPASS} ${DBNAME} -e "SELECT version FROM versions WHERE application = 'GUID'" -BN)
+  GUID=$(mariadb --skip-ssl -u${DBUSER} -p${DBPASS} ${DBNAME} -e "SELECT version FROM versions WHERE application = 'GUID'" -BN)
   trap "[ ${err_count} -gt 1 ] && err_count=$(( ${err_count} - 2 ))" USR1
   while [ ${err_count} -lt ${THRESHOLD} ]; do
     err_c_cur=${err_count}
@@ -269,7 +315,7 @@ unbound_checks() {
     touch /tmp/unbound-mailcow; echo "$(tail -50 /tmp/unbound-mailcow)" > /tmp/unbound-mailcow
     host_ip=$(get_container_ip unbound-mailcow)
     err_c_cur=${err_count}
-    /usr/lib/nagios/plugins/check_dns -s ${host_ip} -H stackoverflow.com 2>> /tmp/unbound-mailcow 1>&2; err_count=$(( ${err_count} + $? ))
+    /usr/lib/mailcow/check_dns.sh -s ${host_ip} -H stackoverflow.com 2>> /tmp/unbound-mailcow 1>&2; err_count=$(( ${err_count} + $? ))
     DNSSEC=$(dig com +dnssec | egrep 'flags:.+ad')
     if [[ -z ${DNSSEC} ]]; then
       echo "DNSSEC failure" 2>> /tmp/unbound-mailcow 1>&2
@@ -302,7 +348,7 @@ redis_checks() {
     touch /tmp/redis-mailcow; echo "$(tail -50 /tmp/redis-mailcow)" > /tmp/redis-mailcow
     host_ip=$(get_container_ip redis-mailcow)
     err_c_cur=${err_count}
-    /usr/lib/nagios/plugins/check_tcp -4 -H redis-mailcow -p 6379 -E -s "PING\n" -q "QUIT" -e "PONG" 2>> /tmp/redis-mailcow 1>&2; err_count=$(( ${err_count} + $? ))
+    /usr/lib/nagios/plugins/check_tcp -4 -H redis-mailcow -p 6379 -E -s "AUTH ${REDISPASS}\nPING\n" -q "QUIT" -e "PONG" 2>> /tmp/redis-mailcow 1>&2; err_count=$(( ${err_count} + $? ))
     [ ${err_c_cur} -eq ${err_count} ] && [ ! $((${err_count} - 1)) -lt 0 ] && err_count=$((${err_count} - 1)) diff_c=1
     [ ${err_c_cur} -ne ${err_count} ] && diff_c=$(( ${err_c_cur} - ${err_count} ))
     progress "Redis" ${THRESHOLD} $(( ${THRESHOLD} - ${err_count} )) ${diff_c}
@@ -326,8 +372,8 @@ mysql_checks() {
   while [ ${err_count} -lt ${THRESHOLD} ]; do
     touch /tmp/mysql-mailcow; echo "$(tail -50 /tmp/mysql-mailcow)" > /tmp/mysql-mailcow
     err_c_cur=${err_count}
-    /usr/lib/nagios/plugins/check_mysql -s /var/run/mysqld/mysqld.sock -u ${DBUSER} -p ${DBPASS} -d ${DBNAME} 2>> /tmp/mysql-mailcow 1>&2; err_count=$(( ${err_count} + $? ))
-    /usr/lib/nagios/plugins/check_mysql_query -s /var/run/mysqld/mysqld.sock -u ${DBUSER} -p ${DBPASS} -d ${DBNAME} -q "SELECT COUNT(*) FROM information_schema.tables" 2>> /tmp/mysql-mailcow 1>&2; err_count=$(( ${err_count} + $? ))
+    /usr/lib/nagios/plugins/check_mysql -f /etc/my.cnf.d/client.cnf -s /var/run/mysqld/mysqld.sock -u ${DBUSER} -p ${DBPASS} -d ${DBNAME} 2>> /tmp/mysql-mailcow 1>&2; err_count=$(( ${err_count} + $? ))
+    /usr/lib/nagios/plugins/check_mysql_query -f /etc/my.cnf.d/client.cnf -s /var/run/mysqld/mysqld.sock -u ${DBUSER} -p ${DBPASS} -d ${DBNAME} -q "SELECT COUNT(*) FROM information_schema.tables" 2>> /tmp/mysql-mailcow 1>&2; err_count=$(( ${err_count} + $? ))
     [ ${err_c_cur} -eq ${err_count} ] && [ ! $((${err_count} - 1)) -lt 0 ] && err_count=$((${err_count} - 1)) diff_c=1
     [ ${err_c_cur} -ne ${err_count} ] && diff_c=$(( ${err_c_cur} - ${err_count} ))
     progress "MySQL/MariaDB" ${THRESHOLD} $(( ${THRESHOLD} - ${err_count} )) ${diff_c}
@@ -351,7 +397,7 @@ mysql_repl_checks() {
   while [ ${err_count} -lt ${THRESHOLD} ]; do
     touch /tmp/mysql_repl_checks; echo "$(tail -50 /tmp/mysql_repl_checks)" > /tmp/mysql_repl_checks
     err_c_cur=${err_count}
-    /usr/lib/nagios/plugins/check_mysql_slavestatus.sh -S /var/run/mysqld/mysqld.sock -u root -p ${DBROOT} 2>> /tmp/mysql_repl_checks 1>&2; err_count=$(( ${err_count} + $? ))
+    /usr/lib/nagios/plugins/check_mysql_slavestatus.sh -o /etc/my.cnf.d/client.cnf -S /var/run/mysqld/mysqld.sock -u root -p ${DBROOT} 2>> /tmp/mysql_repl_checks 1>&2; err_count=$(( ${err_count} + $? ))
     [ ${err_c_cur} -eq ${err_count} ] && [ ! $((${err_count} - 1)) -lt 0 ] && err_count=$((${err_count} - 1)) diff_c=1
     [ ${err_c_cur} -ne ${err_count} ] && diff_c=$(( ${err_c_cur} - ${err_count} ))
     progress "MySQL/MariaDB replication" ${THRESHOLD} $(( ${THRESHOLD} - ${err_count} )) ${diff_c}
@@ -406,6 +452,31 @@ postfix_checks() {
     [ ${err_c_cur} -eq ${err_count} ] && [ ! $((${err_count} - 1)) -lt 0 ] && err_count=$((${err_count} - 1)) diff_c=1
     [ ${err_c_cur} -ne ${err_count} ] && diff_c=$(( ${err_c_cur} - ${err_count} ))
     progress "Postfix" ${THRESHOLD} $(( ${THRESHOLD} - ${err_count} )) ${diff_c}
+    if [[ $? == 10 ]]; then
+      diff_c=0
+      sleep 1
+    else
+      diff_c=0
+      sleep $(( ( RANDOM % 60 ) + 20 ))
+    fi
+  done
+  return 1
+}
+
+postfix-tlspol_checks() {
+  err_count=0
+  diff_c=0
+  THRESHOLD=${POSTFIX_TLSPOL_THRESHOLD}
+  # Reduce error count by 2 after restarting an unhealthy container
+  trap "[ ${err_count} -gt 1 ] && err_count=$(( ${err_count} - 2 ))" USR1
+  while [ ${err_count} -lt ${THRESHOLD} ]; do
+    touch /tmp/postfix-tlspol-mailcow; echo "$(tail -50 /tmp/postfix-tlspol-mailcow)" > /tmp/postfix-tlspol-mailcow
+    host_ip=$(get_container_ip postfix-tlspol-mailcow)
+    err_c_cur=${err_count}
+    /usr/lib/nagios/plugins/check_tcp -4 -H ${host_ip} -p 8642 2>> /tmp/postfix-tlspol-mailcow 1>&2; err_count=$(( ${err_count} + $? ))
+    [ ${err_c_cur} -eq ${err_count} ] && [ ! $((${err_count} - 1)) -lt 0 ] && err_count=$((${err_count} - 1)) diff_c=1
+    [ ${err_c_cur} -ne ${err_count} ] && diff_c=$(( ${err_c_cur} - ${err_count} ))
+    progress "Postfix TLS Policy companion" ${THRESHOLD} $(( ${THRESHOLD} - ${err_count} )) ${diff_c}
     if [[ $? == 10 ]]; then
       diff_c=0
       sleep 1
@@ -475,12 +546,12 @@ dovecot_repl_checks() {
   err_count=0
   diff_c=0
   THRESHOLD=${DOVECOT_REPL_THRESHOLD}
-  D_REPL_STATUS=$(redis-cli -h redis -r GET DOVECOT_REPL_HEALTH)
+  D_REPL_STATUS=$(redis-cli -h redis -a ${REDISPASS} --no-auth-warning -r GET DOVECOT_REPL_HEALTH)
   # Reduce error count by 2 after restarting an unhealthy container
   trap "[ ${err_count} -gt 1 ] && err_count=$(( ${err_count} - 2 ))" USR1
   while [ ${err_count} -lt ${THRESHOLD} ]; do
     err_c_cur=${err_count}
-    D_REPL_STATUS=$(redis-cli --raw -h redis GET DOVECOT_REPL_HEALTH)
+    D_REPL_STATUS=$(redis-cli --raw -h redis -a ${REDISPASS} --no-auth-warning GET DOVECOT_REPL_HEALTH)
     if [[ "${D_REPL_STATUS}" != "1" ]]; then
       err_count=$(( ${err_count} + 1 ))
     fi
@@ -550,19 +621,19 @@ ratelimit_checks() {
   err_count=0
   diff_c=0
   THRESHOLD=${RATELIMIT_THRESHOLD}
-  RL_LOG_STATUS=$(redis-cli -h redis LRANGE RL_LOG 0 0 | jq .qid)
+  RL_LOG_STATUS=$(redis-cli -h redis -a ${REDISPASS} --no-auth-warning LRANGE RL_LOG 0 0 | jq .qid)
   # Reduce error count by 2 after restarting an unhealthy container
   trap "[ ${err_count} -gt 1 ] && err_count=$(( ${err_count} - 2 ))" USR1
   while [ ${err_count} -lt ${THRESHOLD} ]; do
     err_c_cur=${err_count}
     RL_LOG_STATUS_PREV=${RL_LOG_STATUS}
-    RL_LOG_STATUS=$(redis-cli -h redis LRANGE RL_LOG 0 0 | jq .qid)
+    RL_LOG_STATUS=$(redis-cli -h redis -a ${REDISPASS} --no-auth-warning LRANGE RL_LOG 0 0 | jq .qid)
     if [[ ${RL_LOG_STATUS_PREV} != ${RL_LOG_STATUS} ]]; then
       err_count=$(( ${err_count} + 1 ))
       echo 'Last 10 applied ratelimits (may overlap with previous reports).' > /tmp/ratelimit
       echo 'Full ratelimit buckets can be emptied by deleting the ratelimit hash from within mailcow UI (see /debug -> Protocols -> Ratelimit):' >> /tmp/ratelimit
       echo >> /tmp/ratelimit
-      redis-cli --raw -h redis LRANGE RL_LOG 0 10 | jq . >> /tmp/ratelimit
+      redis-cli --raw -h redis -a ${REDISPASS} --no-auth-warning LRANGE RL_LOG 0 10 | jq . >> /tmp/ratelimit
     fi
     [ ${err_c_cur} -eq ${err_count} ] && [ ! $((${err_count} - 1)) -lt 0 ] && err_count=$((${err_count} - 1)) diff_c=1
     [ ${err_c_cur} -ne ${err_count} ] && diff_c=$(( ${err_c_cur} - ${err_count} ))
@@ -645,7 +716,7 @@ acme_checks() {
   err_count=0
   diff_c=0
   THRESHOLD=${ACME_THRESHOLD}
-  ACME_LOG_STATUS=$(redis-cli -h redis GET ACME_FAIL_TIME)
+  ACME_LOG_STATUS=$(redis-cli -h redis -a ${REDISPASS} --no-auth-warning GET ACME_FAIL_TIME)
   if [[ -z "${ACME_LOG_STATUS}" ]]; then
     ${REDIS_CMDLINE} SET ACME_FAIL_TIME 0
     ACME_LOG_STATUS=0
@@ -657,7 +728,7 @@ acme_checks() {
     ACME_LOG_STATUS_PREV=${ACME_LOG_STATUS}
     ACME_LC=0
     until [[ ! -z ${ACME_LOG_STATUS} ]] || [ ${ACME_LC} -ge 3 ]; do
-      ACME_LOG_STATUS=$(redis-cli -h redis GET ACME_FAIL_TIME 2> /dev/null)
+      ACME_LOG_STATUS=$(redis-cli -h redis -a ${REDISPASS} --no-auth-warning GET ACME_FAIL_TIME 2> /dev/null)
       sleep 3
       ACME_LC=$((ACME_LC+1))
     done
@@ -692,8 +763,8 @@ rspamd_checks() {
 From: watchdog@localhost
 
 Empty
-' | usr/bin/curl --max-time 10 -s --data-binary @- --unix-socket /var/lib/rspamd/rspamd.sock http://rspamd/scan | jq -rc .default.required_score)
-    if [[ ${SCORE} != "9999" ]]; then
+' | usr/bin/curl --max-time 10 -s --data-binary @- --unix-socket /var/lib/rspamd/rspamd.sock http://rspamd.${COMPOSE_PROJECT_NAME}_mailcow-network/scan | jq -rc .default.required_score | sed 's/\..*//' )
+    if [[ ${SCORE} -ne 9999 ]]; then
       echo "Rspamd settings check failed, score returned: ${SCORE}" 2>> /tmp/rspamd-mailcow 1>&2
       err_count=$(( ${err_count} + 1))
     else
@@ -746,8 +817,8 @@ olefy_checks() {
 }
 
 # Notify about start
-if [[ ! -z ${WATCHDOG_NOTIFY_EMAIL} ]]; then
-  mail_error "watchdog-mailcow" "Watchdog started monitoring mailcow."
+if [[ ${WATCHDOG_NOTIFY_START} =~ ^([yY][eE][sS]|[yY])+$ ]]; then
+  notify_error "watchdog-mailcow" "Watchdog started monitoring mailcow."
 fi
 
 # Create watchdog agents
@@ -896,6 +967,18 @@ BACKGROUND_TASKS+=(${PID})
 
 (
 while true; do
+  if ! postfix-tlspol_checks; then
+    log_msg "Postfix TLS Policy hit error limit"
+    echo postfix-tlspol-mailcow > /tmp/com_pipe
+  fi
+done
+) &
+PID=$!
+echo "Spawned postfix-tlspol_checks with PID ${PID}"
+BACKGROUND_TASKS+=(${PID})
+
+(
+while true; do
   if ! dovecot_checks; then
     log_msg "Dovecot hit error limit"
     echo dovecot-mailcow > /tmp/com_pipe
@@ -966,6 +1049,7 @@ PID=$!
 echo "Spawned cert_checks with PID ${PID}"
 BACKGROUND_TASKS+=(${PID})
 
+if [[ "${SKIP_OLEFY}" =~ ^([nN][oO]|[nN])+$ ]]; then
 (
 while true; do
   if ! olefy_checks; then
@@ -977,6 +1061,7 @@ done
 PID=$!
 echo "Spawned olefy_checks with PID ${PID}"
 BACKGROUND_TASKS+=(${PID})
+fi
 
 (
 while true; do
@@ -1029,33 +1114,33 @@ while true; do
   fi
   if [[ ${com_pipe_answer} == "ratelimit" ]]; then
     log_msg "At least one ratelimit was applied"
-    [[ ! -z ${WATCHDOG_NOTIFY_EMAIL} ]] && mail_error "${com_pipe_answer}"
+    notify_error "${com_pipe_answer}"
   elif [[ ${com_pipe_answer} == "mail_queue_status" ]]; then
     log_msg "Mail queue status is critical"
-    [[ ! -z ${WATCHDOG_NOTIFY_EMAIL} ]] && mail_error "${com_pipe_answer}"
+    notify_error "${com_pipe_answer}"
   elif [[ ${com_pipe_answer} == "external_checks" ]]; then
     log_msg "Your mailcow is an open relay!"
     # Define $2 to override message text, else print service was restarted at ...
-    [[ ! -z ${WATCHDOG_NOTIFY_EMAIL} ]] && mail_error "${com_pipe_answer}" "Please stop mailcow now and check your network configuration!"
+    notify_error "${com_pipe_answer}" "Please stop mailcow now and check your network configuration!"
   elif [[ ${com_pipe_answer} == "mysql_repl_checks" ]]; then
     log_msg "MySQL replication is not working properly"
     # Define $2 to override message text, else print service was restarted at ...
     # Once mail per 10 minutes
-    [[ ! -z ${WATCHDOG_NOTIFY_EMAIL} ]] && mail_error "${com_pipe_answer}" "Please check the SQL replication status" 600
+    notify_error "${com_pipe_answer}" "Please check the SQL replication status" 600
   elif [[ ${com_pipe_answer} == "dovecot_repl_checks" ]]; then
     log_msg "Dovecot replication is not working properly"
     # Define $2 to override message text, else print service was restarted at ...
     # Once mail per 10 minutes
-    [[ ! -z ${WATCHDOG_NOTIFY_EMAIL} ]] && mail_error "${com_pipe_answer}" "Please check the Dovecot replicator status" 600
+    notify_error "${com_pipe_answer}" "Please check the Dovecot replicator status" 600
   elif [[ ${com_pipe_answer} == "certcheck" ]]; then
     log_msg "Certificates are about to expire"
     # Define $2 to override message text, else print service was restarted at ...
     # Only mail once a day
-    [[ ! -z ${WATCHDOG_NOTIFY_EMAIL} ]] && mail_error "${com_pipe_answer}" "Please renew your certificate" 86400
+    notify_error "${com_pipe_answer}" "Please renew your certificate" 86400
   elif [[ ${com_pipe_answer} == "acme-mailcow" ]]; then
     log_msg "acme-mailcow did not complete successfully"
     # Define $2 to override message text, else print service was restarted at ...
-    [[ ! -z ${WATCHDOG_NOTIFY_EMAIL} ]] && mail_error "${com_pipe_answer}" "Please check acme-mailcow for further information."
+    notify_error "${com_pipe_answer}" "Please check acme-mailcow for further information."
   elif [[ ${com_pipe_answer} == "fail2ban" ]]; then
     F2B_RES=($(timeout 4s ${REDIS_CMDLINE} --raw GET F2B_RES 2> /dev/null))
     if [[ ! -z "${F2B_RES}" ]]; then
@@ -1065,18 +1150,18 @@ while true; do
         log_msg "Banned ${host}"
         rm /tmp/fail2ban 2> /dev/null
         timeout 2s whois "${host}" > /tmp/fail2ban
-        [[ ! -z ${WATCHDOG_NOTIFY_EMAIL} ]] && [[ ${WATCHDOG_NOTIFY_BAN} =~ ^([yY][eE][sS]|[yY])+$ ]] && mail_error "${com_pipe_answer}" "IP ban: ${host}"
+        [[ ${WATCHDOG_NOTIFY_BAN} =~ ^([yY][eE][sS]|[yY])+$ ]] && notify_error "${com_pipe_answer}" "IP ban: ${host}"
       done
     fi
   elif [[ ${com_pipe_answer} =~ .+-mailcow ]]; then
     kill -STOP ${BACKGROUND_TASKS[*]}
     sleep 10
-    CONTAINER_ID=$(curl --silent --insecure https://dockerapi/containers/json | jq -r ".[] | {name: .Config.Labels[\"com.docker.compose.service\"], project: .Config.Labels[\"com.docker.compose.project\"], id: .Id}" | jq -rc "select( .name | tostring | contains(\"${com_pipe_answer}\")) | select( .project | tostring | contains(\"${COMPOSE_PROJECT_NAME,,}\")) | .id")
+    CONTAINER_ID=$(curl --silent --insecure https://dockerapi.${COMPOSE_PROJECT_NAME}_mailcow-network/containers/json | jq -r ".[] | {name: .Config.Labels[\"com.docker.compose.service\"], project: .Config.Labels[\"com.docker.compose.project\"], id: .Id}" | jq -rc "select( .name | tostring | contains(\"${com_pipe_answer}\")) | select( .project | tostring | contains(\"${COMPOSE_PROJECT_NAME,,}\")) | .id")
     if [[ ! -z ${CONTAINER_ID} ]]; then
       if [[ "${com_pipe_answer}" == "php-fpm-mailcow" ]]; then
-        HAS_INITDB=$(curl --silent --insecure -XPOST https://dockerapi/containers/${CONTAINER_ID}/top | jq '.msg.Processes[] | contains(["php -c /usr/local/etc/php -f /web/inc/init_db.inc.php"])' | grep true)
+        HAS_INITDB=$(curl --silent --insecure -XPOST https://dockerapi.${COMPOSE_PROJECT_NAME}_mailcow-network/containers/${CONTAINER_ID}/top | jq '.msg.Processes[] | contains(["php -c /usr/local/etc/php -f /web/inc/init_db.inc.php"])' | grep true)
       fi
-      S_RUNNING=$(($(date +%s) - $(curl --silent --insecure https://dockerapi/containers/${CONTAINER_ID}/json | jq .State.StartedAt | xargs -n1 date +%s -d)))
+      S_RUNNING=$(($(date +%s) - $(curl --silent --insecure https://dockerapi.${COMPOSE_PROJECT_NAME}_mailcow-network/containers/${CONTAINER_ID}/json | jq .State.StartedAt | xargs -n1 date +%s -d)))
       if [ ${S_RUNNING} -lt 360 ]; then
         log_msg "Container is running for less than 360 seconds, skipping action..."
       elif [[ ! -z ${HAS_INITDB} ]]; then
@@ -1084,8 +1169,8 @@ while true; do
         sleep 60
       else
         log_msg "Sending restart command to ${CONTAINER_ID}..."
-        curl --silent --insecure -XPOST https://dockerapi/containers/${CONTAINER_ID}/restart
-        [[ ! -z ${WATCHDOG_NOTIFY_EMAIL} ]] && mail_error "${com_pipe_answer}"
+        curl --silent --insecure -XPOST https://dockerapi.${COMPOSE_PROJECT_NAME}_mailcow-network/containers/${CONTAINER_ID}/restart
+        notify_error "${com_pipe_answer}"
         log_msg "Wait for restarted container to settle and continue watching..."
         sleep 35
       fi
@@ -1095,3 +1180,4 @@ while true; do
     kill -USR1 ${BACKGROUND_TASKS[*]}
   fi
 done
+

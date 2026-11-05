@@ -2,17 +2,22 @@
 
 namespace LdapRecord;
 
+use LDAP\Connection as RawLdapConnection;
+use Ldap\Result;
+use Ldap\ResultEntry;
+
 class Ldap implements LdapInterface
 {
-    use HandlesConnection, DetectsErrors;
+    use DetectsErrors;
+    use HandlesConnection;
 
     /**
-     * @inheritdoc
+     * {@inheritdoc}
      */
-    public function getEntries($searchResults)
+    public function getEntries(mixed $result): array
     {
-        return $this->executeFailableOperation(function () use ($searchResults) {
-            return ldap_get_entries($this->connection, $searchResults);
+        return $this->executeFailableOperation(function () use ($result) {
+            return ldap_get_entries($this->connection, $result);
         });
     }
 
@@ -21,14 +26,12 @@ class Ldap implements LdapInterface
      *
      * @see http://php.net/manual/en/function.ldap-first-entry.php
      *
-     * @param resource $searchResults
-     *
-     * @return resource
+     * @param  Result  $result
      */
-    public function getFirstEntry($searchResults)
+    public function getFirstEntry(mixed $result): mixed
     {
-        return $this->executeFailableOperation(function () use ($searchResults) {
-            return ldap_first_entry($this->connection, $searchResults);
+        return $this->executeFailableOperation(function () use ($result) {
+            return ldap_first_entry($this->connection, $result);
         });
     }
 
@@ -37,11 +40,9 @@ class Ldap implements LdapInterface
      *
      * @see http://php.net/manual/en/function.ldap-next-entry.php
      *
-     * @param resource $entry
-     *
-     * @return resource
+     * @param  ResultEntry  $entry
      */
-    public function getNextEntry($entry)
+    public function getNextEntry(mixed $entry): mixed
     {
         return $this->executeFailableOperation(function () use ($entry) {
             return ldap_next_entry($this->connection, $entry);
@@ -53,11 +54,9 @@ class Ldap implements LdapInterface
      *
      * @see http://php.net/manual/en/function.ldap-get-attributes.php
      *
-     * @param resource $entry
-     *
-     * @return array|false
+     * @param  ResultEntry  $entry
      */
-    public function getAttributes($entry)
+    public function getAttributes(mixed $entry): array|false
     {
         return $this->executeFailableOperation(function () use ($entry) {
             return ldap_get_attributes($this->connection, $entry);
@@ -65,58 +64,44 @@ class Ldap implements LdapInterface
     }
 
     /**
-     * Returns the number of entries from a search result.
-     *
-     * @see http://php.net/manual/en/function.ldap-count-entries.php
-     *
-     * @param resource $searchResults
-     *
-     * @return int
+     * {@inheritDoc}
      */
-    public function countEntries($searchResults)
+    public function countEntries(mixed $result): int
     {
-        return $this->executeFailableOperation(function () use ($searchResults) {
-            return ldap_count_entries($this->connection, $searchResults);
+        return $this->executeFailableOperation(function () use ($result) {
+            return ldap_count_entries($this->connection, $result);
         });
     }
 
     /**
-     * Compare value of attribute found in entry specified with DN.
-     *
-     * @see http://php.net/manual/en/function.ldap-compare.php
-     *
-     * @param string $dn
-     * @param string $attribute
-     * @param string $value
-     *
-     * @return mixed
+     * {@inheritDoc}
      */
-    public function compare($dn, $attribute, $value)
+    public function compare(string $dn, string $attribute, string $value, ?array $controls = null): bool|int
     {
-        return $this->executeFailableOperation(function () use ($dn, $attribute, $value) {
-            return ldap_compare($this->connection, $dn, $attribute, $value);
+        return $this->executeFailableOperation(function () use ($dn, $attribute, $value, $controls) {
+            return ldap_compare($this->connection, $dn, $attribute, $value, $controls);
         });
     }
 
     /**
-     * @inheritdoc
+     * {@inheritdoc}
      */
-    public function getLastError()
+    public function getLastError(): ?string
     {
         if (! $this->connection) {
-            return;
+            return null;
         }
 
         return ldap_error($this->connection);
     }
 
     /**
-     * @inheritdoc
+     * {@inheritdoc}
      */
-    public function getDetailedError()
+    public function getDetailedError(): ?DetailedError
     {
         if (! $number = $this->errNo()) {
-            return;
+            return null;
         }
 
         $this->getOption(LDAP_OPT_DIAGNOSTIC_MESSAGE, $message);
@@ -125,16 +110,9 @@ class Ldap implements LdapInterface
     }
 
     /**
-     * Get all binary values from the specified result entry.
-     *
-     * @see http://php.net/manual/en/function.ldap-get-values-len.php
-     *
-     * @param $entry
-     * @param $attribute
-     *
-     * @return array
+     * {@inheritDoc}
      */
-    public function getValuesLen($entry, $attribute)
+    public function getValuesLen(mixed $entry, string $attribute): array|false
     {
         return $this->executeFailableOperation(function () use ($entry, $attribute) {
             return ldap_get_values_len($this->connection, $entry, $attribute);
@@ -142,17 +120,17 @@ class Ldap implements LdapInterface
     }
 
     /**
-     * @inheritdoc
+     * {@inheritdoc}
      */
-    public function setOption($option, $value)
+    public function setOption(int $option, mixed $value): bool
     {
         return ldap_set_option($this->connection, $option, $value);
     }
 
     /**
-     * @inheritdoc
+     * {@inheritdoc}
      */
-    public function getOption($option, &$value = null)
+    public function getOption(int $option, mixed &$value = null): mixed
     {
         ldap_get_option($this->connection, $option, $value);
 
@@ -163,58 +141,63 @@ class Ldap implements LdapInterface
      * Set a callback function to do re-binds on referral chasing.
      *
      * @see http://php.net/manual/en/function.ldap-set-rebind-proc.php
-     *
-     * @param callable $callback
-     *
-     * @return bool
      */
-    public function setRebindCallback(callable $callback)
+    public function setRebindCallback(callable $callback): bool
     {
         return ldap_set_rebind_proc($this->connection, $callback);
     }
 
     /**
-     * @inheritdoc
+     * {@inheritdoc}
      */
-    public function startTLS()
+    public function startTLS(): bool
     {
-        return $this->executeFailableOperation(function () {
+        return $this->secure = $this->executeFailableOperation(function () {
             return ldap_start_tls($this->connection);
         });
     }
 
     /**
-     * @inheritdoc
+     * {@inheritdoc}
      */
-    public function connect($hosts = [], $port = 389)
+    public function connect(string|array $hosts = [], int $port = 389, ?string $protocol = null): bool
     {
         $this->bound = false;
-
+        $this->protocol = $protocol;
         $this->host = $this->makeConnectionUris($hosts, $port);
 
-        return $this->connection = $this->executeFailableOperation(function () {
+        $this->connection = $this->executeFailableOperation(function () {
             return ldap_connect($this->host);
         });
+
+        return $this->connection instanceof RawLdapConnection;
     }
 
     /**
-     * @inheritdoc
+     * {@inheritdoc}
      */
-    public function close()
+    public function close(): bool
     {
-        $result = is_resource($this->connection) ? @ldap_close($this->connection) : false;
+        $result = false;
 
-        $this->connection = null;
+        if ($this->connection instanceof RawLdapConnection) {
+            $result = @ldap_close($this->connection);
+        }
+
         $this->bound = false;
+        $this->secure = false;
+
         $this->host = null;
+        $this->protocol = null;
+        $this->connection = null;
 
         return $result;
     }
 
     /**
-     * @inheritdoc
+     * {@inheritdoc}
      */
-    public function search($dn, $filter, array $fields, $onlyAttributes = false, $size = 0, $time = 0, $deref = null, $serverControls = [])
+    public function search(string $dn, string $filter, array $fields, bool $onlyAttributes = false, int $size = 0, int $time = 0, int $deref = LDAP_DEREF_NEVER, ?array $controls = null): mixed
     {
         return $this->executeFailableOperation(function () use (
             $dn,
@@ -224,18 +207,16 @@ class Ldap implements LdapInterface
             $size,
             $time,
             $deref,
-            $serverControls
+            $controls
         ) {
-            return empty($serverControls)
-                ? ldap_search($this->connection, $dn, $filter, $fields, $onlyAttributes, $size, $time, $deref)
-                : ldap_search($this->connection, $dn, $filter, $fields, $onlyAttributes, $size, $time, $deref, $serverControls);
+            return ldap_search($this->connection, $dn, $filter, $fields, $onlyAttributes, $size, $time, $deref, $controls);
         });
     }
 
     /**
-     * @inheritdoc
+     * {@inheritdoc}
      */
-    public function listing($dn, $filter, array $fields, $onlyAttributes = false, $size = 0, $time = 0, $deref = null, $serverControls = [])
+    public function list(string $dn, string $filter, array $fields, bool $onlyAttributes = false, int $size = 0, int $time = 0, int $deref = LDAP_DEREF_NEVER, ?array $controls = null): mixed
     {
         return $this->executeFailableOperation(function () use (
             $dn,
@@ -245,18 +226,16 @@ class Ldap implements LdapInterface
             $size,
             $time,
             $deref,
-            $serverControls
+            $controls
         ) {
-            return empty($serverControls)
-                ? ldap_list($this->connection, $dn, $filter, $fields, $onlyAttributes, $size, $time, $deref)
-                : ldap_list($this->connection, $dn, $filter, $fields, $onlyAttributes, $size, $time, $deref, $serverControls);
+            return ldap_list($this->connection, $dn, $filter, $fields, $onlyAttributes, $size, $time, $deref, $controls);
         });
     }
 
     /**
-     * @inheritdoc
+     * {@inheritdoc}
      */
-    public function read($dn, $filter, array $fields, $onlyAttributes = false, $size = 0, $time = 0, $deref = null, $serverControls = [])
+    public function read(string $dn, string $filter, array $fields, bool $onlyAttributes = false, int $size = 0, int $time = 0, int $deref = LDAP_DEREF_NEVER, ?array $controls = null): mixed
     {
         return $this->executeFailableOperation(function () use (
             $dn,
@@ -266,47 +245,78 @@ class Ldap implements LdapInterface
             $size,
             $time,
             $deref,
-            $serverControls
+            $controls
         ) {
-            return empty($serverControls)
-                ? ldap_read($this->connection, $dn, $filter, $fields, $onlyAttributes, $size, $time, $deref)
-                : ldap_read($this->connection, $dn, $filter, $fields, $onlyAttributes, $size, $time, $deref, $serverControls);
+            return ldap_read($this->connection, $dn, $filter, $fields, $onlyAttributes, $size, $time, $deref, $controls);
         });
     }
 
     /**
-     * @inheritdoc
+     * {@inheritdoc}
      */
-    public function parseResult($result, &$errorCode, &$dn, &$errorMessage, &$referrals, &$serverControls = [])
+    public function parseResult(mixed $result, int &$errorCode = 0, ?string &$dn = null, ?string &$errorMessage = null, ?array &$referrals = null, ?array &$controls = null): LdapResultResponse|false
     {
-        return $this->executeFailableOperation(function () use (
-            $result,
-            &$errorCode,
-            &$dn,
-            &$errorMessage,
-            &$referrals,
-            &$serverControls
-        ) {
-            return empty($serverControls)
-                ? ldap_parse_result($this->connection, $result, $errorCode, $dn, $errorMessage, $referrals)
-                : ldap_parse_result($this->connection, $result, $errorCode, $dn, $errorMessage, $referrals, $serverControls);
-        });
+        if (ldap_parse_result($this->connection, $result, $errorCode, $dn, $errorMessage, $referrals, $controls)) {
+            return new LdapResultResponse(
+                $errorCode,
+                $dn,
+                $errorMessage,
+                $referrals,
+                $controls
+            );
+        }
+
+        return false;
     }
 
     /**
-     * @inheritdoc
+     * {@inheritdoc}
      */
-    public function bind($username, $password)
+    public function bind(?string $dn = null, ?string $password = null, ?array $controls = null): LdapResultResponse
     {
-        return $this->bound = $this->executeFailableOperation(function () use ($username, $password) {
-            return ldap_bind($this->connection, $username, html_entity_decode($password));
+        /** @var \LDAP\Result $result */
+        $result = $this->executeFailableOperation(function () use ($dn, $password, $controls) {
+            return ldap_bind_ext($this->connection, $dn, $password ? html_entity_decode($password) : null, $controls);
+        });
+
+        $response = $this->parseResult($result);
+
+        $this->handleBindResponse($response);
+
+        return $response;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    public function saslBind(?string $dn = null, ?string $password = null, array $options = []): bool
+    {
+        return $this->executeFailableOperation(function () use ($dn, $password, $options) {
+            $options = array_merge([
+                'mech' => null,
+                'realm' => null,
+                'authc_id' => null,
+                'authz_id' => null,
+                'props' => null,
+            ], $options);
+
+            return $this->bound = ldap_sasl_bind(
+                $this->connection,
+                $dn,
+                $password ? html_entity_decode($password) : null,
+                $options['mech'],
+                $options['realm'],
+                $options['authc_id'],
+                $options['authz_id'],
+                $options['props'],
+            );
         });
     }
 
     /**
-     * @inheritdoc
+     * {@inheritdoc}
      */
-    public function add($dn, array $entry)
+    public function add(string $dn, array $entry): bool
     {
         return $this->executeFailableOperation(function () use ($dn, $entry) {
             return ldap_add($this->connection, $dn, $entry);
@@ -314,9 +324,9 @@ class Ldap implements LdapInterface
     }
 
     /**
-     * @inheritdoc
+     * {@inheritdoc}
      */
-    public function delete($dn)
+    public function delete(string $dn): bool
     {
         return $this->executeFailableOperation(function () use ($dn) {
             return ldap_delete($this->connection, $dn);
@@ -324,9 +334,9 @@ class Ldap implements LdapInterface
     }
 
     /**
-     * @inheritdoc
+     * {@inheritdoc}
      */
-    public function rename($dn, $newRdn, $newParent, $deleteOldRdn = false)
+    public function rename(string $dn, string $newRdn, string $newParent, bool $deleteOldRdn = false): bool
     {
         return $this->executeFailableOperation(function () use (
             $dn,
@@ -339,9 +349,9 @@ class Ldap implements LdapInterface
     }
 
     /**
-     * @inheritdoc
+     * {@inheritdoc}
      */
-    public function modify($dn, array $entry)
+    public function modify(string $dn, array $entry): bool
     {
         return $this->executeFailableOperation(function () use ($dn, $entry) {
             return ldap_modify($this->connection, $dn, $entry);
@@ -349,9 +359,9 @@ class Ldap implements LdapInterface
     }
 
     /**
-     * @inheritdoc
+     * {@inheritdoc}
      */
-    public function modifyBatch($dn, array $values)
+    public function modifyBatch(string $dn, array $values): bool
     {
         return $this->executeFailableOperation(function () use ($dn, $values) {
             return ldap_modify_batch($this->connection, $dn, $values);
@@ -359,9 +369,9 @@ class Ldap implements LdapInterface
     }
 
     /**
-     * @inheritdoc
+     * {@inheritdoc}
      */
-    public function modAdd($dn, array $entry)
+    public function modAdd(string $dn, array $entry): bool
     {
         return $this->executeFailableOperation(function () use ($dn, $entry) {
             return ldap_mod_add($this->connection, $dn, $entry);
@@ -369,9 +379,9 @@ class Ldap implements LdapInterface
     }
 
     /**
-     * @inheritdoc
+     * {@inheritdoc}
      */
-    public function modReplace($dn, array $entry)
+    public function modReplace(string $dn, array $entry): bool
     {
         return $this->executeFailableOperation(function () use ($dn, $entry) {
             return ldap_mod_replace($this->connection, $dn, $entry);
@@ -379,9 +389,9 @@ class Ldap implements LdapInterface
     }
 
     /**
-     * @inheritdoc
+     * {@inheritdoc}
      */
-    public function modDelete($dn, array $entry)
+    public function modDelete(string $dn, array $entry): bool
     {
         return $this->executeFailableOperation(function () use ($dn, $entry) {
             return ldap_mod_del($this->connection, $dn, $entry);
@@ -389,89 +399,63 @@ class Ldap implements LdapInterface
     }
 
     /**
-     * @inheritdoc
+     * {@inheritdoc}
      */
-    public function controlPagedResult($pageSize = 1000, $isCritical = false, $cookie = '')
-    {
-        return $this->executeFailableOperation(function () use ($pageSize, $isCritical, $cookie) {
-            return ldap_control_paged_result($this->connection, $pageSize, $isCritical, $cookie);
-        });
-    }
-
-    /**
-     * @inheritdoc
-     */
-    public function controlPagedResultResponse($result, &$cookie, &$estimated = null)
-    {
-        return $this->executeFailableOperation(function () use ($result, &$cookie, &$estimated) {
-            return ldap_control_paged_result_response($this->connection, $result, $cookie, $estimated);
-        });
-    }
-
-    /**
-     * @inheritdoc
-     */
-    public function freeResult($result)
+    public function freeResult(mixed $result): bool
     {
         return ldap_free_result($result);
     }
 
     /**
-     * @inheritdoc
+     * {@inheritdoc}
      */
-    public function errNo()
+    public function errNo(): ?int
     {
         return $this->connection ? ldap_errno($this->connection) : null;
     }
 
     /**
-     * @inheritdoc
+     * {@inheritdoc}
      */
-    public function err2Str($number)
+    public function err2Str(int $number): string
     {
         return ldap_err2str($number);
     }
 
     /**
-     * Returns the extended error hex code of the last command.
-     *
-     * @return string|null
+     * Get the extended error hex code of the last command.
      */
-    public function getExtendedErrorHex()
+    public function getExtendedErrorHex(): ?string
     {
         if (preg_match("/(?<=data\s).*?(?=,)/", $this->getExtendedError(), $code)) {
             return $code[0];
         }
+
+        return null;
     }
 
     /**
-     * Returns the extended error code of the last command.
-     *
-     * @return bool|string
+     * Get the extended error code of the last command.
      */
-    public function getExtendedErrorCode()
+    public function getExtendedErrorCode(): string|false
     {
         return $this->extractDiagnosticCode($this->getExtendedError());
     }
 
     /**
      * Extract the diagnostic code from the message.
-     *
-     * @param string $message
-     *
-     * @return string|bool
      */
-    public function extractDiagnosticCode($message)
+    public function extractDiagnosticCode(string $message): string|false
     {
         preg_match('/^([\da-fA-F]+):/', $message, $matches);
 
-        return isset($matches[1]) ? $matches[1] : false;
+        return $matches[1] ?? false;
     }
 
     /**
-     * @inheritdoc
+     * {@inheritdoc}
      */
-    public function getDiagnosticMessage()
+    public function getDiagnosticMessage(): ?string
     {
         $this->getOption(LDAP_OPT_ERROR_STRING, $message);
 

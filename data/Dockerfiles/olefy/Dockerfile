@@ -1,6 +1,8 @@
-FROM alpine:3.14
-LABEL maintainer "Andre Peters <andre.peters@servercow.de>"
+FROM alpine:3.24
 
+LABEL maintainer = "The Infrastructure Company GmbH <info@servercow.de>"
+
+ARG PIP_BREAK_SYSTEM_PACKAGES=1
 WORKDIR /app
 
 #RUN addgroup -S olefy && adduser -S olefy -G olefy \
@@ -8,11 +10,11 @@ RUN apk add --virtual .build-deps gcc musl-dev python3-dev libffi-dev openssl-de
   && apk add --update --no-cache python3 py3-pip openssl tzdata libmagic \
   && pip3 install --upgrade pip \
   && pip3 install --upgrade asyncio python-magic \
-  && pip3 install --upgrade https://github.com/HeinleinSupport/oletools/archive/master.zip \
+  && pip3 install --upgrade https://github.com/decalage2/oletools/archive/master.zip \
   && apk del .build-deps
-#  && sed -i 's/decompress_stream(bytearray(compressed_code))/bytes2str(decompress_stream(bytearray(compressed_code)))/g' /usr/lib/python3.8/site-packages/oletools/olevba.py
+#  && sed -i 's/template_injection_detected = True/template_injection_detected = False/g' /usr/lib/python3.9/site-packages/oletools/olevba.py
 
-ADD https://raw.githubusercontent.com/HeinleinSupport/olefy/master/olefy.py /app/
+ADD olefy.py /app/
 
 RUN chown -R nobody:nobody /app /tmp
 

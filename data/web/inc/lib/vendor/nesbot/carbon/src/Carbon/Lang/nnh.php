@@ -8,6 +8,7 @@
  * For the full copyright and license information, please view the LICENSE
  * file that was distributed with this source code.
  */
+
 return array_replace_recursive(require __DIR__.'/en.php', [
     'meridiem' => ['mbaʼámbaʼ', 'ncwònzém'],
     'weekdays' => null,
@@ -19,9 +20,9 @@ return array_replace_recursive(require __DIR__.'/en.php', [
     'formats' => [
         'LT' => 'HH:mm',
         'LTS' => 'HH:mm:ss',
-        'L' => 'DD/MM/yy',
+        'L' => 'DD/MM/YY',
         'LL' => 'D MMM, YYYY',
-        'LLL' => '[lyɛ]̌ʼ d [na] MMMM, YYYY HH:mm',
-        'LLLL' => 'dddd , [lyɛ]̌ʼ d [na] MMMM, YYYY HH:mm',
+        'LLL' => '[lyɛ]̌ʼ D [na] MMMM, YYYY HH:mm',
+        'LLLL' => 'dddd , [lyɛ]̌ʼ D [na] MMMM, YYYY HH:mm',
     ],
 ]);

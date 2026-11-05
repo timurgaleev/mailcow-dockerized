@@ -13,48 +13,39 @@ class Logger
 {
     /**
      * The logger instance.
-     *
-     * @var LoggerInterface|null
      */
-    protected $logger;
+    protected ?LoggerInterface $logger;
 
     /**
      * Constructor.
-     *
-     * @param LoggerInterface|null $logger
      */
-    public function __construct(LoggerInterface $logger = null)
+    public function __construct(?LoggerInterface $logger = null)
     {
         $this->logger = $logger;
     }
 
     /**
      * Logs the given event.
-     *
-     * @param mixed $event
-     *
-     * @return void
      */
-    public function log($event)
+    public function log($event): void
     {
         switch (true) {
             case $event instanceof AuthEvent:
-                return $this->auth($event);
+                $this->auth($event);
+                break;
             case $event instanceof ModelEvent:
-                return $this->model($event);
+                $this->model($event);
+                break;
             case $event instanceof QueryEvent:
-                return $this->query($event);
+                $this->query($event);
+                break;
         }
     }
 
     /**
      * Logs an authentication event.
-     *
-     * @param AuthEvent $event
-     *
-     * @return void
      */
-    public function auth(AuthEvent $event)
+    public function auth(AuthEvent $event): void
     {
         if (isset($this->logger)) {
             $connection = $event->getConnection();
@@ -77,12 +68,8 @@ class Logger
 
     /**
      * Logs a model event.
-     *
-     * @param ModelEvent $event
-     *
-     * @return void
      */
-    public function model(ModelEvent $event)
+    public function model(ModelEvent $event): void
     {
         if (isset($this->logger)) {
             $model = $event->getModel();
@@ -102,12 +89,8 @@ class Logger
 
     /**
      * Logs a query event.
-     *
-     * @param QueryEvent $event
-     *
-     * @return void
      */
-    public function query(QueryEvent $event)
+    public function query(QueryEvent $event): void
     {
         if (isset($this->logger)) {
             $query = $event->getQuery();
@@ -128,13 +111,9 @@ class Logger
     }
 
     /**
-     * Returns the operational name of the given event.
-     *
-     * @param mixed $event
-     *
-     * @return string
+     * Get the operational name of the given event.
      */
-    protected function getOperationName($event)
+    protected function getOperationName($event): string
     {
         return (new ReflectionClass($event))->getShortName();
     }

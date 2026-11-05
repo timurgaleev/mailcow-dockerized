@@ -69,11 +69,11 @@ return [
     'diff_after_tomorrow' => 'overmorgen',
     'diff_before_yesterday' => 'eergisteren',
     'period_recurrences' => ':count keer',
-    'period_interval' => function (string $interval = '') {
+    'period_interval' => static function (string $interval = '') {
         /** @var string $output */
-        $output = preg_replace('/^(een|één|1)\s+/', '', $interval);
+        $output = preg_replace('/^(een|één|1)\s+/u', '', $interval);
 
-        if (preg_match('/^(een|één|1)( jaar|j| uur|u)/', $interval)) {
+        if (preg_match('/^(een|één|1)( jaar|j| uur|u)/u', $interval)) {
             return "elk $output";
         }
 
@@ -97,12 +97,11 @@ return [
         'lastWeek' => '[afgelopen] dddd [om] LT',
         'sameElse' => 'L',
     ],
-    'ordinal' => function ($number) {
+    'ordinal' => static function ($number) {
         return $number.(($number === 1 || $number === 8 || $number >= 20) ? 'ste' : 'de');
     },
     'months' => ['januari', 'februari', 'maart', 'april', 'mei', 'juni', 'juli', 'augustus', 'september', 'oktober', 'november', 'december'],
-    'months_short' => ['jan', 'feb', 'mrt', 'apr', 'mei', 'jun', 'jul', 'aug', 'sep', 'okt', 'nov', 'dec'],
-    'mmm_suffix' => '.',
+    'months_short' => ['jan.', 'feb.', 'mrt.', 'apr.', 'mei', 'jun.', 'jul.', 'aug.', 'sep.', 'okt.', 'nov.', 'dec.'],
     'weekdays' => ['zondag', 'maandag', 'dinsdag', 'woensdag', 'donderdag', 'vrijdag', 'zaterdag'],
     'weekdays_short' => ['zo.', 'ma.', 'di.', 'wo.', 'do.', 'vr.', 'za.'],
     'weekdays_min' => ['zo', 'ma', 'di', 'wo', 'do', 'vr', 'za'],

@@ -1,5 +1,7 @@
 <?php
 
+declare(strict_types=1);
+
 /**
  * This file is part of the Carbon package.
  *
@@ -8,8 +10,11 @@
  * For the full copyright and license information, please view the LICENSE
  * file that was distributed with this source code.
  */
+
 namespace Carbon\Traits;
 
+use BadMethodCallException;
+use Carbon\Callback;
 use Carbon\Carbon;
 use Carbon\CarbonImmutable;
 use Carbon\CarbonInterface;
@@ -24,12 +29,12 @@ trait IntervalStep
      *
      * @var Closure|null
      */
-    protected $step;
+    protected ?Closure $step = null;
 
     /**
      * Get the dynamic step in use.
      *
-     * @return Closure
+     * @return Closure|null
      */
     public function getStep(): ?Closure
     {
@@ -60,11 +65,12 @@ trait IntervalStep
      */
     public function convertDate(DateTimeInterface $dateTime, bool $negated = false): CarbonInterface
     {
-        /** @var CarbonInterface $carbonDate */
-        $carbonDate = $dateTime instanceof CarbonInterface ? $dateTime : $this->resolveCarbon($dateTime);
+        $carbonDate = $this->carbonOrResolve($dateTime);
 
         if ($this->step) {
-            return $carbonDate->setDateTimeFrom(($this->step)($carbonDate->avoidMutation(), $negated));
+            $carbonDate = Callback::parameter($this->step, $carbonDate->avoidMutation());
+
+            return $carbonDate->modify(($this->step)($carbonDate, $negated)->format('Y-m-d H:i:s.u e O'));
         }
 
         if ($negated) {
@@ -76,17 +82,32 @@ trait IntervalStep
 
     /**
      * Convert DateTimeImmutable instance to CarbonImmutable instance and DateTime instance to Carbon instance.
-     *
-     * @param DateTimeInterface $dateTime
-     *
-     * @return Carbon|CarbonImmutable
      */
-    private function resolveCarbon(DateTimeInterface $dateTime)
+    private function resolveCarbon(DateTimeInterface $dateTime): Carbon|CarbonImmutable
     {
         if ($dateTime instanceof DateTimeImmutable) {
             return CarbonImmutable::instance($dateTime);
         }
 
         return Carbon::instance($dateTime);
+    }
+
+    private function carbonOrResolve(mixed $dateTime): CarbonInterface
+    {
+        return $dateTime instanceof CarbonInterface
+            ? $dateTime
+            : $this->resolveCarbon($dateTime);
+    }
+
+    private function checkNoStepIsDefined(string $method): void
+    {
+        if ($this->step !== null) {
+            $chunks = explode('::', $method, 2);
+            $method = $chunks[1] ?? $method;
+
+            throw new BadMethodCallException(
+                "->$method() cannot be called on an interval with a step",
+            );
+        }
     }
 }

@@ -71,6 +71,7 @@ if (isset($_SESSION['mailcow_cc_role']) && ($_SESSION['mailcow_cc_role'] == "adm
   // Init records array
   $spf_link = '<a href="http://www.open-spf.org/SPF_Record_Syntax/" target="_blank">SPF Record Syntax</a><br />';
   $dmarc_link = '<a href="https://www.kitterman.com/dmarc/assistant.html" target="_blank">DMARC Assistant</a>';
+  $mtasts_report_link = '<a href="https://mxtoolbox.com/dmarc/smtp-tls/how-to-setup-smtp-tls-reports" target="_blank">TLS Report Record Syntax</a>';
 
   $records = array();
 
@@ -125,6 +126,36 @@ if (isset($_SESSION['mailcow_cc_role']) && ($_SESSION['mailcow_cc_role'] == "adm
       'autoconfig.' . $domain,
       'CNAME',
       $mailcow_hostname
+    );
+  }
+
+  // Check if domain is an alias domain and get target domain's MTA-STS
+  $alias_domain_details = mailbox('get', 'alias_domain_details', $domain);
+  $mta_sts_domain = $domain;
+  
+  if ($alias_domain_details !== false && !empty($alias_domain_details['target_domain'])) {
+    // This is an alias domain, check target domain for MTA-STS
+    $mta_sts_domain = $alias_domain_details['target_domain'];
+  }
+  
+  $mta_sts = mailbox('get', 'mta_sts', $mta_sts_domain);
+  if (count($mta_sts) > 0 && $mta_sts['active'] == 1) {
+    if (!in_array($domain, $alias_domains)) {
+      $records[] = array(
+        'mta-sts.' . $domain,
+        'CNAME',
+        $mailcow_hostname
+      );
+    }
+    $records[] = array(
+        '_mta-sts.' . $domain,
+        'TXT',
+        "v={$mta_sts['version']};id={$mta_sts['id']};",
+    );
+    $records[] = array(
+        '_smtp._tls.' . $domain,
+        'TXT',
+        $mtasts_report_link,
     );
   }
 
@@ -341,25 +372,35 @@ if (isset($_SESSION['mailcow_cc_role']) && ($_SESSION['mailcow_cc_role'] == "adm
         }
 
         foreach ($currents as &$current) {
+          if ($current['type'] == "TXT" &&
+              stripos(strtolower($current['txt']), 'v=sts') === 0) {
+            if (strtolower($current[$data_field[$current['type']]]) == strtolower($record[2])) {
+              $state = state_good;
+            }
+            else {
+              $state = state_nomatch;
+            }
+            $state .= '<br />' . htmlspecialchars($current[$data_field[$current['type']]]);
+          }
           if ($current['type'] == 'TXT' &&
-          stripos($current['txt'], 'v=dmarc') === 0 &&
-          $record[2] == $dmarc_link) {
+              stripos($current['txt'], 'v=dmarc') === 0 &&
+              $record[2] == $dmarc_link) {
             $current['txt'] = str_replace(' ', '', $current['txt']);
-            $state = $current[$data_field[$current['type']]] . state_optional;
+            $state = htmlspecialchars($current[$data_field[$current['type']]]) . state_optional;
           }
           elseif ($current['type'] == 'TXT' &&
-          stripos($current['txt'], 'v=spf') === 0 &&
-          $record[2] == $spf_link) {
+                  stripos($current['txt'], 'v=spf') === 0 &&
+                  $record[2] == $spf_link) {
             $state = state_nomatch;
             $rslt = get_spf_allowed_hosts($record[0], true);
             if (in_array($ip, $rslt) && in_array(expand_ipv6($ip6), $rslt)) {
               $state = state_good;
             }
-            $state .= '<br />' . $current[$data_field[$current['type']]] . state_optional;
+            $state .= '<br />' . htmlspecialchars($current[$data_field[$current['type']]]) . state_optional;
           }
           elseif ($current['type'] == 'TXT' &&
-          stripos($current['txt'], 'v=dkim') === 0 &&
-          stripos($record[2], 'v=dkim') === 0) {
+                  stripos($current['txt'], 'v=dkim') === 0 &&
+                  stripos($record[2], 'v=dkim') === 0) {
             preg_match('/v=DKIM1;.*k=rsa;.*p=([^;]*).*/i', $current[$data_field[$current['type']]], $dkim_matches_current);
             preg_match('/v=DKIM1;.*k=rsa;.*p=([^;]*).*/i', $record[2], $dkim_matches_good);
             if ($dkim_matches_current[1] == $dkim_matches_good[1]) {
@@ -367,7 +408,7 @@ if (isset($_SESSION['mailcow_cc_role']) && ($_SESSION['mailcow_cc_role'] == "adm
             }
           }
           elseif ($current['type'] != 'TXT' &&
-          isset($data_field[$current['type']]) && $state != state_good) {
+                  isset($data_field[$current['type']]) && $state != state_good) {
             $state = state_nomatch;
             if ($current[$data_field[$current['type']]] == $record[2]) {
               $state = state_good;
@@ -385,7 +426,7 @@ if (isset($_SESSION['mailcow_cc_role']) && ($_SESSION['mailcow_cc_role'] == "adm
         if ($state == state_nomatch) {
           $state = array();
           foreach ($currents as $current) {
-            $state[] = $current[$data_field[$current['type']]];
+            $state[] = htmlspecialchars($current[$data_field[$current['type']]]);
           }
           $state = implode('<br />', $state);
         }
@@ -395,11 +436,21 @@ if (isset($_SESSION['mailcow_cc_role']) && ($_SESSION['mailcow_cc_role'] == "adm
           <td>%s</td>
           <td class="dns-found">%s</td>
           <td class="dns-recommended">%s</td>
-        </tr>', $record[0], $record[1], $record[2], $state);
+        </tr>', htmlspecialchars($record[0]), htmlspecialchars($record[1]), $record[2], $state);
         $record[3] = explode('<br />', $state);
       }
 
       unset($record);
+
+      // Make a hostname RHS absolute so it is not read relative to $ORIGIN.
+      // Already-absolute names, the SRV root target "." and IP addresses are left alone.
+      $absolutize = function($host) {
+        $host = trim($host);
+        if ($host === '' || $host === '.' || substr($host, -1) === '.' || filter_var($host, FILTER_VALIDATE_IP)) {
+          return $host;
+        }
+        return $host . '.';
+      };
 
       $dns_data = sprintf("\$ORIGIN %s.\n", $domain);
       foreach ($records as $record) {
@@ -421,22 +472,32 @@ if (isset($_SESSION['mailcow_cc_role']) && ($_SESSION['mailcow_cc_role'] == "adm
               $val = str_replace(state_optional, '', $val);
               $val = str_replace(state_good, '', $val);
               if (strlen($val) > 0) {
+                // these are all TXT values, their RHS is a character string, not a name
                 $vals[] = sprintf("%s\tIN\t%s\t%s\n", $label, $record[1], $val);
               }
             }
           }
           else {
+            if ($record[1] == 'MX' || $record[1] == 'CNAME') {
+              $val = $absolutize($val);
+            }
+            elseif ($record[1] == 'SRV') {
+              // format here is "target port"; only the target is a name
+              $parts = explode(' ', $val, 2);
+              $parts[0] = $absolutize($parts[0]);
+              $val = implode(' ', $parts);
+            }
             $vals[] = sprintf("%s\tIN\t%s\t%s\n", $label, $record[1], $val);
           }
 
           foreach ($vals as $val) {
-            $dns_data .= str_replace($domain, $domain . '.', $val);
+            $dns_data .= $val;
           }
         }
       }
       ?>
     </table>
-    <a id='download-zonefile' class="btn btn-sm btn-default visible-xs-block visible-sm-inline visible-md-inline visible-lg-inline" style="margin-top:10px" data-zonefile="<?=base64_encode($dns_data);?>" download='<?=$_GET['domain'];?>.txt' type='text/csv'>Download</a>
+    <a id='download-zonefile' class="btn btn-sm btn-secondary visible-xs-block visible-sm-inline visible-md-inline visible-lg-inline mb-4" style="margin-top:10px" data-zonefile="<?=base64_encode($dns_data);?>" download='<?=htmlspecialchars($_GET['domain']);?>.txt' type='text/csv'>Download</a>
     <script>
       var zonefile_dl_link = document.getElementById('download-zonefile');
       var zonefile = atob(zonefile_dl_link.getAttribute('data-zonefile'));
